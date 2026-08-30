@@ -6,3 +6,7 @@ Logs
 *.sln
 *.dwlt
 MOSS-TTS-Nano
+*.csproj
+.vs
+Assets/Models
+obj

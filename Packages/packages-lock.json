@@ -5,7 +5,7 @@
       "depth": 2,
       "source": "registry",
       "dependencies": {},
-      "url": "https://packages.unity.cn"
+      "url": "https://packages.unity.com"
     },
     "com.unity.ide.visualstudio": {
       "version": "2.0.28",
@@ -14,7 +14,7 @@
       "dependencies": {
         "com.unity.test-framework": "1.1.33"
       },
-      "url": "https://packages.unity.cn"
+      "url": "https://packages.unity.com"
     },
     "com.unity.test-framework": {
       "version": "1.1.33",
@@ -25,7 +25,7 @@
         "com.unity.modules.imgui": "1.0.0",
         "com.unity.modules.jsonserialize": "1.0.0"
       },
-      "url": "https://packages.unity.cn"
+      "url": "https://packages.unity.com"
     },
     "com.unity.ugui": {
       "version": "1.0.0",
@@ -35,6 +35,22 @@
         "com.unity.modules.ui": "1.0.0",
         "com.unity.modules.imgui": "1.0.0"
       }
+    },
+    "onnxruntime": {
+      "version": "https://github.com/xue-fei/onnxruntime-unity.git",
+      "depth": 0,
+      "source": "git",
+      "dependencies": {},
+      "hash": "f8cfbf149ddfacbb64ae22538134b74ebfdf71aa"
+    },
+    "onnxruntime-cuda": {
+      "version": "https://github.com/xue-fei/onnxruntime-unity-cuda.git",
+      "depth": 0,
+      "source": "git",
+      "dependencies": {
+        "onnxruntime": "https://github.com/xue-fei/onnxruntime-unity.git#main"
+      },
+      "hash": "901b7edc4549f6a8d7712495c0c73005d014f243"
     },
     "com.unity.modules.ai": {
       "version": "1.0.0",

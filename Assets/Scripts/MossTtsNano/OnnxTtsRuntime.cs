@@ -28,6 +28,12 @@ namespace MossTtsNano
         /// </summary>
         public bool CollapseDegenerateSilence { get; set; } = false;
 
+        /// <summary>
+        /// 生成完成后回调整帧序列，供离线校验工具导出 token 做数值对比。
+        /// 生产路径不设置此委托，因此没有开销。
+        /// </summary>
+        public Action<List<int[]>> FrameTraceSink { get; set; }
+
         public OnnxTtsRuntime(
             string modelDir,
             int threadCount = 4,
@@ -235,6 +241,7 @@ namespace MossTtsNano
             if (!streaming)
             {
                 generatedFrames = GenerateAudioFrames((inputIds, attentionMask));
+                FrameTraceSink?.Invoke(generatedFrames);
                 if (generatedFrames.Count == 0)
                 {
                     Debug.LogWarning($"[OnnxTtsRuntime] No audio frames generated for '{text}' (model stopped at step 0)");

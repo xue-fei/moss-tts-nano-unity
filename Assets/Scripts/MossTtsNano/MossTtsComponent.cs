@@ -93,6 +93,10 @@ namespace MossTtsNano
         [Tooltip("音频重复惩罚")]
         public float AudioRepetitionPenalty = 1.2f;
 
+        [Tooltip("随机种子。留空(-1)表示每次随机；填正整数可复现同一条音频。\n" +
+                 "模型在部分 seed 下会自己生成大段静音，固定一个听感好的 seed 是最省事的规避手段。")]
+        public int Seed = -1;
+
         [Header("流式合成")]
         [Tooltip("启用流式合成")]
         public bool Streaming = false;
@@ -191,6 +195,15 @@ namespace MossTtsNano
         }
 
         /// <summary>
+        /// 把 Inspector 上的 Seed 字段翻译成运行时参数。
+        /// 负值表示"不固定"，交给运行时用默认时间种子；非负值原样传入以便复现。
+        /// </summary>
+        private int? ResolveSeed()
+        {
+            return Seed < 0 ? (int?)null : Seed;
+        }
+
+        /// <summary>
         /// 合成语音
         /// </summary>
         public void Synthesize(
@@ -221,7 +234,8 @@ namespace MossTtsNano
                     maxNewFrames: MaxNewFrames,
                     voiceCloneMaxTextTokens: VoiceCloneMaxTextTokens,
                     doSample: DoSample,
-                    sampleMode: SampleMode);
+                    sampleMode: SampleMode,
+                    seed: ResolveSeed());
 
                 _mainThreadQueue.Enqueue(() =>
                 {
@@ -263,7 +277,8 @@ namespace MossTtsNano
                     maxNewFrames: MaxNewFrames,
                     voiceCloneMaxTextTokens: VoiceCloneMaxTextTokens,
                     doSample: DoSample,
-                    sampleMode: SampleMode);
+                    sampleMode: SampleMode,
+                    seed: ResolveSeed());
 
                 _mainThreadQueue.Enqueue(() =>
                 {
@@ -315,7 +330,8 @@ namespace MossTtsNano
                         voice: voice ?? DefaultVoice,
                         promptAudioPath: promptAudioPath,
                         maxNewFrames: MaxNewFrames,
-                        voiceCloneMaxTextTokens: VoiceCloneMaxTextTokens);
+                        voiceCloneMaxTextTokens: VoiceCloneMaxTextTokens,
+                        seed: ResolveSeed());
                 }, ct);
 
                 _mainThreadQueue.Enqueue(() =>

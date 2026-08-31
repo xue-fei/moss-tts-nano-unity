@@ -343,6 +343,7 @@ MonoBehaviour:
   TextTemperature: 1
   AudioTemperature: 0.8
   AudioRepetitionPenalty: 1.2
+  Seed: 4
   Streaming: 0
   StreamPlayDelay: 0.1
   OnSynthesisComplete:

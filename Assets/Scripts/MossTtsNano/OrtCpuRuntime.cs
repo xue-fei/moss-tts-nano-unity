@@ -76,32 +76,33 @@ namespace MossTtsNano
 
         private void LoadManifest()
         {
-            string[] candidatePaths = {
-                Path.Combine(_modelDir, "browser_poc_manifest.json"),
-                Path.Combine(_modelDir, "MOSS-TTS-Nano-100M-ONNX", "browser_poc_manifest.json"),
-                Path.Combine(_modelDir, "MOSS-TTS-Nano-ONNX-CPU", "browser_poc_manifest.json")
-            };
+            // modelDir 由调用方解析为 StreamingAssets/Models/MOSS-TTS-Nano-ONNX，
+            // manifest 就在该目录根下。
+            string manifestPath = Path.Combine(_modelDir, "browser_poc_manifest.json");
 
-            foreach (string path in candidatePaths)
-            {
-                if (File.Exists(path))
-                {
-                    string json = File.ReadAllText(path);
-                    _manifest = JsonConvert.DeserializeObject<ModelManifest>(json);
-                    Debug.Log($"[OrtCpuRuntime] Manifest loaded from {path}");
-                    Debug.Log($"[OrtCpuRuntime] prompt_templates: {(_manifest.prompt_templates != null ? "OK" : "NULL")}");
-                    Debug.Log($"[OrtCpuRuntime] tts_config: {(_manifest.tts_config != null ? "OK" : "NULL")}");
-                    Debug.Log($"[OrtCpuRuntime] builtin_voices: {(_manifest.builtin_voices?.Length.ToString() ?? "NULL")}");
-                    return;
-                }
-            }
+            if (!File.Exists(manifestPath))
+                throw new FileNotFoundException(
+                    $"browser_poc_manifest.json not found at {manifestPath}. " +
+                    $"模型应位于 StreamingAssets/Models/MOSS-TTS-Nano-ONNX 下。");
 
-            throw new FileNotFoundException($"browser_poc_manifest.json not found in {_modelDir}");
+            string json = File.ReadAllText(manifestPath);
+            _manifest = JsonConvert.DeserializeObject<ModelManifest>(json);
+            Debug.Log($"[OrtCpuRuntime] Manifest loaded from {manifestPath}");
+            Debug.Log($"[OrtCpuRuntime] prompt_templates: {(_manifest.prompt_templates != null ? "OK" : "NULL")}");
+            Debug.Log($"[OrtCpuRuntime] tts_config: {(_manifest.tts_config != null ? "OK" : "NULL")}");
+            Debug.Log($"[OrtCpuRuntime] builtin_voices: {(_manifest.builtin_voices?.Length.ToString() ?? "NULL")}");
         }
 
         private void LoadTtsMeta()
         {
-            string path = ResolveManifestRelativePath(_manifest.model_files.tts_meta);
+            // tts_meta 在 manifest 同目录（manifest 里就是裸文件名）。
+            string path = Path.Combine(_modelDir, _manifest.model_files.tts_meta);
+
+            if (!File.Exists(path))
+                throw new FileNotFoundException(
+                    $"tts meta not found at {path} " +
+                    $"(manifest declared '{_manifest.model_files.tts_meta}')。");
+
             string json = File.ReadAllText(path);
             _ttsMeta = JsonConvert.DeserializeObject<TtsModelMeta>(json);
             _ttsDir = Path.GetDirectoryName(path);
@@ -110,42 +111,20 @@ namespace MossTtsNano
 
         private void LoadCodecMeta()
         {
-            string path = ResolveManifestRelativePath(_manifest.model_files.codec_meta);
+            // codec 目录嵌套在模型目录内，而 manifest 里写的是同级布局的 "../" 路径，
+            // 两种布局的兼容逻辑统一放在 ModelPaths 里（OnnxRuntimeEngine 共用同一实现）。
+            string path = ModelPaths.ResolveCodecMeta(_modelDir, _manifest.model_files.codec_meta);
+
             if (!File.Exists(path))
-            {
-                // Fallback: try relative to manifest dir without ".."
-                string fallback = Path.Combine(_modelDir, "MOSS-Audio-Tokenizer-Nano-ONNX", "codec_browser_onnx_meta.json");
-                if (File.Exists(fallback))
-                    path = fallback;
-            }
+                throw new FileNotFoundException(
+                    $"codec meta not found at {path} " +
+                    $"(manifest declared '{_manifest.model_files.codec_meta}')。" +
+                    $"请确认 StreamingAssets/Models/MOSS-TTS-Nano-ONNX 下的 codec 子目录完整。");
+
             string json = File.ReadAllText(path);
             _codecMeta = JsonConvert.DeserializeObject<CodecModelMeta>(json);
             _codecDir = Path.GetDirectoryName(path);
             Debug.Log($"[OrtCpuRuntime] CodecMeta loaded: sample_rate={_codecMeta.codec_config.sample_rate}, streaming_decode={_codecMeta.streaming_decode != null}");
-        }
-
-        protected string ResolveManifestRelativePath(string relativePath)
-        {
-            string resolved = Path.Combine(_modelDir, relativePath);
-            if (File.Exists(resolved)) return resolved;
-
-            // 尝试别名替换
-            var aliasMap = new Dictionary<string, string>
-            {
-                { "MOSS-TTS-Nano-ONNX-CPU", "MOSS-TTS-Nano-100M-ONNX" },
-                { "MOSS-Audio-Tokenizer-Nano-ONNX-CPU", "MOSS-Audio-Tokenizer-Nano-ONNX" }
-            };
-
-            foreach (var kvp in aliasMap)
-            {
-                if (relativePath.Contains(kvp.Key))
-                {
-                    string rewritten = Path.Combine(_modelDir, relativePath.Replace(kvp.Key, kvp.Value));
-                    if (File.Exists(rewritten)) return rewritten;
-                }
-            }
-
-            return resolved;
         }
 
         /// <summary>

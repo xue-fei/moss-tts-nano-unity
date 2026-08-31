@@ -19,9 +19,45 @@ namespace MossTtsNano
     /// </summary>
     public class MossTtsComponent : MonoBehaviour
     {
+        /// <summary>
+        /// 模型目录相对 StreamingAssets 的默认位置。
+        /// 模型已从 Assets/Models 移到 Assets/StreamingAssets/Models，
+        /// 因为 .onnx / .data 不是 Unity 可识别的资源类型，放在 Assets 下
+        /// 打包时不会被复制到运行时目录；StreamingAssets 才会原样输出。
+        /// </summary>
+        public const string DefaultModelDir = "Models/MOSS-TTS-Nano-ONNX";
+
+        /// <summary>
+        /// 模型目录的绝对路径。运行时与 Editor 下都指向 StreamingAssets。
+        /// </summary>
+        public static string ResolveModelDir()
+        {
+            return Path.Combine(Application.streamingAssetsPath, DefaultModelDir);
+        }
+
+        /// <summary>
+        /// 把历史遗留的路径写法归一化为「相对 StreamingAssets」的形式。
+        /// 处理 "Assets/StreamingAssets/Models/X"、"Assets/Models/X"、
+        /// "StreamingAssets/Models/X" 三种旧值，全部收敛到 "Models/X"。
+        /// </summary>
+        public static string NormalizeModelDir(string dir)
+        {
+            if (string.IsNullOrEmpty(dir)) return DefaultModelDir;
+
+            string normalized = dir.Replace('\\', '/').TrimStart('/');
+
+            if (normalized.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase))
+                normalized = normalized.Substring("Assets/".Length);
+
+            if (normalized.StartsWith("StreamingAssets/", StringComparison.OrdinalIgnoreCase))
+                normalized = normalized.Substring("StreamingAssets/".Length);
+
+            return normalized;
+        }
+
         [Header("模型配置")]
-        [Tooltip("模型目录路径（包含 browser_poc_manifest.json）")]
-        public string ModelDir = "Models/MOSS-TTS-Nano-ONNX";
+        [Tooltip("模型目录，相对于 StreamingAssets（包含 browser_poc_manifest.json）")]
+        public string ModelDir = DefaultModelDir;
 
         [Tooltip("输出目录")]
         public string OutputDir = "";
@@ -30,7 +66,7 @@ namespace MossTtsNano
         public int ThreadCount = 4;
 
         [Tooltip("执行提供者 (cpu/cuda)")]
-        public string ExecutionProvider = "cpu";
+        public string ExecutionProvider = "cuda";
 
         [Header("合成参数")]
         [Tooltip("默认语音")]
@@ -123,34 +159,23 @@ namespace MossTtsNano
         {
             try
             {
-                // 尝试多个可能路径
-                string[] candidatePaths = {
-                    Path.Combine(Application.streamingAssetsPath, ModelDir),
-                    Path.Combine(Application.dataPath, ModelDir),
-                    Path.Combine("Assets", ModelDir),
-                    ModelDir
-                };
+                string relativeDir = NormalizeModelDir(ModelDir);
+                string modelDir = Path.GetFullPath(
+                    Path.Combine(Application.streamingAssetsPath, relativeDir));
 
-                string modelDir = null;
-                foreach (var path in candidatePaths)
+                if (!Directory.Exists(modelDir) ||
+                    !File.Exists(Path.Combine(modelDir, "browser_poc_manifest.json")))
                 {
-                    string fullPath = Path.GetFullPath(path);
-                    if (Directory.Exists(fullPath) && File.Exists(Path.Combine(fullPath, "browser_poc_manifest.json")))
-                    {
-                        modelDir = fullPath;
-                        break;
-                    }
-                }
-
-                if (modelDir == null)
-                {
-                    Debug.LogError($"[MossTts] Model directory not found. Searched: {string.Join(", ", candidatePaths)}");
+                    Debug.LogError(
+                        $"[MossTts] Model directory not found or missing browser_poc_manifest.json: {modelDir}\n" +
+                        $"(ModelDir='{ModelDir}' → '{relativeDir}', " +
+                        $"streamingAssetsPath='{Application.streamingAssetsPath}')");
                     OnError?.Invoke("Model directory not found");
                     return;
                 }
 
                 string outputDir = string.IsNullOrEmpty(OutputDir)
-                    ? Path.Combine(Application.persistentDataPath, "MossTtsOutput")
+                    ? Path.Combine(Application.dataPath, "MossTtsOutput")
                     : OutputDir;
 
                 _service = new MossTtsService(modelDir, outputDir, ThreadCount, ExecutionProvider);

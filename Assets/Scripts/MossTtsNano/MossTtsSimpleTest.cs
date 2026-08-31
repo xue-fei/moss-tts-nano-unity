@@ -12,7 +12,8 @@ namespace MossTtsNano
     public class MossTtsSimpleTest : MonoBehaviour
     {
         [Header("Test Settings")]
-        public string modelPath = "Assets/Models/MOSS-TTS-Nano-ONNX";
+        [Tooltip("模型目录，相对于 StreamingAssets（仅作展示，实际由 MossTtsComponent.ModelDir 决定）")]
+        public string modelPath = MossTtsComponent.DefaultModelDir;
         public string testText = "欢迎关注模思智能，这是一个语音合成测试。";
         public bool runOnStart = true;
         public bool playAfterSynthesis = true;

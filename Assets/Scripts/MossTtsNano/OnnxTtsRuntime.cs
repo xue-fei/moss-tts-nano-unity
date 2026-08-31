@@ -28,7 +28,11 @@ namespace MossTtsNano
             string outputDir = null)
             : base(modelDir, threadCount, maxNewFrames, doSample, sampleMode, executionProvider)
         {
-            _outputDir = Path.Combine(Application.dataPath, "MossTtsOutput");
+            // 原来这里无条件用 Application.dataPath，既忽略了传入的 outputDir，
+            // 又会把 WAV 写进 Assets/（Editor 下污染工程，打包后 dataPath 不可写）。
+            _outputDir = string.IsNullOrEmpty(outputDir)
+                ? Path.Combine(Application.persistentDataPath, "MossTtsOutput")
+                : outputDir;
             Directory.CreateDirectory(_outputDir);
             _tokenCache = new Dictionary<string, int>();
             _voiceCache = new Dictionary<string, List<int[]>>();
@@ -39,10 +43,9 @@ namespace MossTtsNano
 
         private void InitializeTokenizer(string modelDir)
         {
-            // 尝试多个路径查找 tokenizer 词汇表
+            // 词表与模型同目录（StreamingAssets/Models/MOSS-TTS-Nano-ONNX/）
             string[] candidatePaths = {
                 Path.Combine(_modelDir, "tokenizer_vocab_parallel.json"),
-                Path.Combine(_modelDir, "MOSS-TTS-Nano-100M-ONNX", "tokenizer_vocab_parallel.json"),
                 Path.Combine(_modelDir, "tokenizer.model")
             };
 

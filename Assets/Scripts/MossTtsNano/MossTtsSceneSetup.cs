@@ -12,7 +12,9 @@ namespace MossTtsNano
         public bool createTTSObject = true;
         public bool createSimpleTest = true;
         public bool createCanvas = false;
-        public string modelPath = "Assets/Models/MOSS-TTS-Nano-ONNX";
+
+        [Tooltip("模型目录，相对于 StreamingAssets")]
+        public string modelPath = MossTtsComponent.DefaultModelDir;
 
         [Header("Test Text")]
         public string testText = "欢迎关注模思智能，这是一个语音合成测试。";
@@ -32,8 +34,10 @@ namespace MossTtsNano
             ttsObj.transform.SetParent(transform);
 
             // 添加 MossTtsComponent
+            // modelPath 走统一归一化，兼容 Inspector 里残留的 "Assets/Models/..." 旧值
+            string relativeModelDir = MossTtsComponent.NormalizeModelDir(modelPath);
             var ttsComponent = ttsObj.AddComponent<MossTtsComponent>();
-            ttsComponent.ModelDir = modelPath.Replace("Assets/", "").Replace("Assets\\", "");
+            ttsComponent.ModelDir = relativeModelDir;
 
             // 添加 AudioSource
             var audioSource = ttsObj.AddComponent<UnityEngine.AudioSource>();
@@ -43,7 +47,8 @@ namespace MossTtsNano
             if (createSimpleTest)
             {
                 var test = ttsObj.AddComponent<MossTtsSimpleTest>();
-                test.modelPath = modelPath;
+                // 传归一化后的值，避免 Inspector 上显示已失效的旧路径
+                test.modelPath = relativeModelDir;
                 test.testText = testText;
             }
 

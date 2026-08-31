@@ -47,6 +47,7 @@ namespace MossTtsNano
             float topP,
             System.Random rng)
         {
+        {
             if (!doSample)
                 return Argmax(values);
 

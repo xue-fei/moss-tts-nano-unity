@@ -15,7 +15,9 @@ namespace MossTtsNano
         {
             Debug.Log("[MossTtsBatchTest] Starting batch test...");
 
-            string modelDir = Path.Combine(Application.dataPath, "Models", "MOSS-TTS-Nano-ONNX");
+            // 模型位于 StreamingAssets/Models 下（.onnx/.data 不是 Unity 资源类型，
+            // 放在 Assets 里打包时不会被复制到运行时目录）
+            string modelDir = MossTtsComponent.ResolveModelDir();
             string outputDir = Path.Combine(Application.persistentDataPath, "MossTtsOutput");
             Directory.CreateDirectory(outputDir);
 

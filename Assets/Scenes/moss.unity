@@ -315,7 +315,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6418b18aeeab9b84b99fbcf0091eaa70, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  modelPath: Assets/Models/MOSS-TTS-Nano-ONNX
+  modelPath: Models/MOSS-TTS-Nano-ONNX
   testText: "\u6B22\u8FCE\u5173\u6CE8\u6A21\u601D\u667A\u80FD\uFF0C\u8FD9\u662F\u4E00\u4E2A\u8BED\u97F3\u5408\u6210\u6D4B\u8BD5\u3002"
   runOnStart: 1
   playAfterSynthesis: 1
@@ -334,7 +334,7 @@ MonoBehaviour:
   ModelDir: Models/MOSS-TTS-Nano-ONNX
   OutputDir: 
   ThreadCount: 4
-  ExecutionProvider: cpu
+  ExecutionProvider: cuda
   DefaultVoice: Junhao
   MaxNewFrames: 375
   VoiceCloneMaxTextTokens: 75

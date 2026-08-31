@@ -50,6 +50,13 @@ namespace MossTtsNano
 
         private Dictionary<string, NamedOnnxValue> _streamingInputs;
 
+        // 复用缓冲区：repetition_seen_mask 每帧都是 [1, nVq, codebookSize] = 16×1024 个 int（64KB）。
+        // 每帧新建会在 375 帧的生成过程中产生约 24MB 垃圾，Unity 下会触发可感知的 GC 卡顿。
+        private int[] _repetitionMaskBuffer;
+        private DenseTensor<int> _repetitionMaskTensor;
+        private float[] _audioRandomBuffer;
+        private DenseTensor<float> _audioRandomTensor;
+
         public void LoadManifest(string manifestPath)
         {
             string json = File.ReadAllText(manifestPath);
@@ -62,13 +69,15 @@ namespace MossTtsNano
             _ttsMeta = JsonConvert.DeserializeObject<TtsModelMeta>(ttsMetaJson);
             _codebookSize = _ttsMeta.model_config.audio_codebook_sizes[0];
 
-            // Resolve codec_meta path
-            string codecMetaPath = Path.Combine(_modelDir, _manifest.model_files.codec_meta);
+            // codec 目录嵌套在模型目录内，manifest 里却写的是同级布局的 "../" 路径，
+            // 两种布局的兼容逻辑统一在 ModelPaths（OrtCpuRuntime 共用同一实现）。
+            string codecMetaPath = ModelPaths.ResolveCodecMeta(_modelDir, _manifest.model_files.codec_meta);
             if (!File.Exists(codecMetaPath))
-            {
-                // Fallback: try relative to manifest dir without ".."
-                codecMetaPath = Path.Combine(_modelDir, "MOSS-Audio-Tokenizer-Nano-ONNX", "codec_browser_onnx_meta.json");
-            }
+                throw new FileNotFoundException(
+                    $"codec meta not found at {codecMetaPath} " +
+                    $"(manifest declared '{_manifest.model_files.codec_meta}')。" +
+                    $"请确认 StreamingAssets/Models/MOSS-TTS-Nano-ONNX 下的 codec 子目录完整。");
+
             string codecMetaJson = File.ReadAllText(codecMetaPath);
             _codecMeta = JsonConvert.DeserializeObject<CodecModelMeta>(codecMetaJson);
             _codecDir = Path.GetDirectoryName(codecMetaPath);
@@ -226,9 +235,7 @@ namespace MossTtsNano
             // global_hidden: [1, seqLen, hidden_size] → take last timestep
             var globalHiddenTensor = results.First(r => r.Name == "global_hidden").AsTensor<float>();
             int hiddenSize = globalHiddenTensor.Dimensions[globalHiddenTensor.Dimensions.Length - 1];
-            float[] globalHidden = new float[hiddenSize];
-            for (int i = 0; i < hiddenSize; i++)
-                globalHidden[i] = globalHiddenTensor.GetValue((int)(globalHiddenTensor.Length - hiddenSize + i));
+            float[] globalHidden = TensorTail(globalHiddenTensor, hiddenSize);
 
             var pastStates = new Dictionary<string, float[]>();
             foreach (string name in outputNames)
@@ -270,9 +277,7 @@ namespace MossTtsNano
             // global_hidden: [1, 1, hidden_size] → take last timestep
             var globalHiddenTensor = results.First(r => r.Name == "global_hidden").AsTensor<float>();
             int hiddenSize = globalHiddenTensor.Dimensions[globalHiddenTensor.Dimensions.Length - 1];
-            float[] globalHidden = new float[hiddenSize];
-            for (int i = 0; i < hiddenSize; i++)
-                globalHidden[i] = globalHiddenTensor.GetValue((int)(globalHiddenTensor.Length - hiddenSize + i));
+            float[] globalHidden = TensorTail(globalHiddenTensor, hiddenSize);
 
             var newPastStates = new Dictionary<string, float[]>();
             foreach (string name in outputNames)
@@ -315,26 +320,46 @@ namespace MossTtsNano
             return (textLogits, audioLogits);
         }
 
+        /// <summary>
+        /// 构建 repetition_seen_mask 张量，复用同一块缓冲区。
+        /// 形状 [1, nVq, codebookSize]，每帧调用一次；每次新建会在长文本合成时
+        /// 产生大量 LOH 垃圾（16×1024×4B = 64KB/帧），因此改为原地清零 + 重填。
+        /// </summary>
+        private DenseTensor<int> BuildRepetitionMask(List<HashSet<int>> previousTokenSetsByChannel, int codebookSize)
+        {
+            int total = _nVq * codebookSize;
+            if (_repetitionMaskBuffer == null || _repetitionMaskBuffer.Length != total)
+            {
+                _repetitionMaskBuffer = new int[total];
+                _repetitionMaskTensor = new DenseTensor<int>(_repetitionMaskBuffer, new[] { 1, _nVq, codebookSize });
+            }
+            else
+            {
+                Array.Clear(_repetitionMaskBuffer, 0, total);
+            }
+
+            int channels = Math.Min(previousTokenSetsByChannel.Count, _nVq);
+            for (int ch = 0; ch < channels; ch++)
+            {
+                int channelBase = ch * codebookSize;
+                foreach (int tokenId in previousTokenSetsByChannel[ch])
+                {
+                    if (tokenId >= 0 && tokenId < codebookSize)
+                        _repetitionMaskBuffer[channelBase + tokenId] = 1;
+                }
+            }
+
+            return _repetitionMaskTensor;
+        }
+
         public (bool shouldContinue, int[] frameTokenIds) LocalGreedyFrame(
             float[] globalHidden, List<HashSet<int>> previousTokenSetsByChannel, float repetitionPenalty)
         {
             if (_localGreedyFrameSession == null)
                 throw new InvalidOperationException("LocalGreedyFrame session not loaded");
 
-            int audioCodebookSize = _codebookSize;
-
-            var maskData = new int[1 * _nVq * audioCodebookSize];
-            for (int ch = 0; ch < previousTokenSetsByChannel.Count; ch++)
-            {
-                foreach (int tokenId in previousTokenSetsByChannel[ch])
-                {
-                    if (tokenId >= 0 && tokenId < audioCodebookSize)
-                        maskData[ch * audioCodebookSize + tokenId] = 1;
-                }
-            }
-
             var globalHiddenTensor = new DenseTensor<float>(globalHidden, new[] { 1, globalHidden.Length });
-            var maskTensor = new DenseTensor<int>(maskData, new[] { 1, _nVq, audioCodebookSize });
+            var maskTensor = BuildRepetitionMask(previousTokenSetsByChannel, _codebookSize);
             var penaltyTensor = new DenseTensor<float>(new[] { repetitionPenalty }, new[] { 1 });
 
             var inputs = new NamedOnnxValue[]
@@ -358,25 +383,22 @@ namespace MossTtsNano
             if (_localFixedSampledFrameSession == null)
                 throw new InvalidOperationException("LocalFixedSampledFrame session not loaded");
 
-            int audioCodebookSize = _codebookSize;
+            var maskTensor = BuildRepetitionMask(previousTokenSetsByChannel, _codebookSize);
 
-            var maskData = new int[1 * _nVq * audioCodebookSize];
-            for (int ch = 0; ch < previousTokenSetsByChannel.Count; ch++)
+            // 随机数缓冲同样复用，避免每帧的 LINQ 分配。
+            if (_audioRandomBuffer == null || _audioRandomBuffer.Length != _nVq)
             {
-                foreach (int tokenId in previousTokenSetsByChannel[ch])
-                {
-                    if (tokenId >= 0 && tokenId < audioCodebookSize)
-                        maskData[ch * audioCodebookSize + tokenId] = 1;
-                }
+                _audioRandomBuffer = new float[_nVq];
+                _audioRandomTensor = new DenseTensor<float>(_audioRandomBuffer, new[] { 1, _nVq });
             }
+            for (int i = 0; i < _nVq; i++)
+                _audioRandomBuffer[i] = (float)rng.NextDouble();
 
             float assistantRandom = (float)rng.NextDouble();
-            float[] audioRandom = Enumerable.Range(0, _nVq).Select(_ => (float)rng.NextDouble()).ToArray();
 
             var globalHiddenTensor = new DenseTensor<float>(globalHidden, new[] { 1, globalHidden.Length });
-            var maskTensor = new DenseTensor<int>(maskData, new[] { 1, _nVq, audioCodebookSize });
             var assistantRandomTensor = new DenseTensor<float>(new[] { assistantRandom }, new[] { 1 });
-            var audioRandomTensor = new DenseTensor<float>(audioRandom, new[] { 1, _nVq });
+            var audioRandomTensor = _audioRandomTensor;
 
             var inputs = new NamedOnnxValue[]
             {
@@ -594,10 +616,9 @@ namespace MossTtsNano
 
         private DenseTensor<T> CloneTensor<T>(Tensor<T> tensor) where T : struct
         {
-            T[] data = new T[tensor.Length];
-            for (int i = 0; i < tensor.Length; i++)
-                data[i] = tensor.GetValue(i);
-            return new DenseTensor<T>(data, tensor.Dimensions.ToArray());
+            // 走 TensorToArray 的 span 快路径，避免逐元素 GetValue。
+            // 流式解码每帧都要克隆 12 组 attention cache，这里是热点。
+            return new DenseTensor<T>(TensorToArray(tensor), tensor.Dimensions.ToArray());
         }
 
         public void CodecDecodeStepReset()
@@ -630,11 +651,57 @@ namespace MossTtsNano
             return result;
         }
 
-        private T[] TensorToArray<T>(Tensor<T> tensor) where T : struct
+        /// <summary>
+        /// 把张量内容拷成托管数组。
+        ///
+        /// 性能说明：ORT 返回的张量实际类型都是 DenseTensor&lt;T&gt;，其 Buffer 是连续内存，
+        /// 可以直接 Span.CopyTo 走 memcpy。原实现用 tensor.GetValue(i) 逐元素读，
+        /// 每次都要过虚方法 + 边界检查 + ArrayUtilities.GetIndex 计算多维索引；
+        /// 单次 decode step 要搬 24 个 KV 张量（约 415 万元素），60 步累计约 2.5 亿次虚调用，
+        /// 是 C# 侧最大的单项开销。这里优先走 span 路径，非 DenseTensor 时才回退逐元素。
+        /// </summary>
+        private static T[] TensorToArray<T>(Tensor<T> tensor) where T : struct
         {
-            T[] result = new T[tensor.Length];
-            for (int i = 0; i < tensor.Length; i++)
+            int length = (int)tensor.Length;
+
+            if (tensor is DenseTensor<T> dense)
+            {
+                var span = dense.Buffer.Span;
+                // Buffer 理论上可能大于逻辑长度，按 Length 截断后再拷。
+                if (span.Length >= length)
+                    return span.Slice(0, length).ToArray();
+            }
+
+            T[] result = new T[length];
+            for (int i = 0; i < length; i++)
                 result[i] = tensor.GetValue(i);
+            return result;
+        }
+
+        /// <summary>
+        /// 从张量尾部取 count 个元素（用于取 global_hidden 的最后一个时间步）。
+        /// 同样优先走连续内存拷贝，避免逐元素 GetValue。
+        /// </summary>
+        private static float[] TensorTail(Tensor<float> tensor, int count)
+        {
+            int length = (int)tensor.Length;
+            int offset = Math.Max(0, length - count);
+            int actual = Math.Min(count, length);
+
+            if (tensor is DenseTensor<float> dense)
+            {
+                var span = dense.Buffer.Span;
+                if (span.Length >= length)
+                {
+                    float[] fast = new float[count];
+                    span.Slice(offset, actual).CopyTo(fast);
+                    return fast;
+                }
+            }
+
+            float[] result = new float[count];
+            for (int i = 0; i < actual; i++)
+                result[i] = tensor.GetValue(offset + i);
             return result;
         }
 

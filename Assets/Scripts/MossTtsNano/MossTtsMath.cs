@@ -160,9 +160,14 @@ namespace MossTtsNano
                 indices[b + 1] = cur;
             }
 
-            // 对存活候选做 softmax（降序，供 top-p 累积使用）
+            // 对存活候选做 softmax（降序，供 top-p 累积使用）。
+            // 累加用 double：Python 的 _softmax 是
+            //   shifted = np.asarray(values - max_value, dtype=np.float64)
+            //   exps / np.sum(exps, dtype=np.float64)
+            // 即 exp 与求和都在 float64 下完成。1024 路 float 累加的舍入误差
+            // 足以在 top-p 边界上改变保留的候选数量，进而选到不同的 token。
             float max = scores[indices[0]];
-            float sum = 0f;
+            double sum = 0.0;
             for (int a = 0; a < survivors; a++)
             {
                 float e = Mathf.Exp(scores[indices[a]] - max);
@@ -172,10 +177,10 @@ namespace MossTtsNano
 
             // Top-P 截断：累积首次超过 topP 的候选保留，其后全部丢弃
             int keep = survivors;
-            if (topP > 0f && topP < 1f && sum > 0f)
+            if (topP > 0f && topP < 1f && sum > 0.0)
             {
-                float invSum = 1f / sum;
-                float cumulative = 0f;
+                double invSum = 1.0 / sum;
+                double cumulative = 0.0;
                 for (int a = 0; a < survivors; a++)
                 {
                     cumulative += scratch[a] * invSum;
@@ -183,16 +188,19 @@ namespace MossTtsNano
                 }
             }
 
-            float keepSum = 0f;
+            double keepSum = 0.0;
             for (int a = 0; a < keep; a++) keepSum += scratch[a];
-            if (keepSum <= 0f) return indices[0];
+            if (keepSum <= 0.0) return indices[0];
 
             // 概率写回原始索引位置，保持与原实现相同的遍历顺序
             Array.Clear(probs, 0, n);
-            float invKeepSum = 1f / keepSum;
+            double invKeepSum = 1.0 / keepSum;
             for (int a = 0; a < keep; a++)
-                probs[indices[a]] = scratch[a] * invKeepSum;
+                probs[indices[a]] = (float)(scratch[a] * invKeepSum);
 
+            // Python 侧是 float(rng.random()) ∈ [0, 1)，逆 CDF 逐项相减。
+            // 极端情况下 float 概率之和略小于 1，随机数落在尾部会走完循环，
+            // 此时按原实现回退到最高分候选。
             float randomValue = (float)rng.NextDouble();
             for (int i = 0; i < n; i++)
             {

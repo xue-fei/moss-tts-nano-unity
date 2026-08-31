@@ -298,11 +298,16 @@ namespace MossTtsNano
         }
 
         /// <summary>
-        /// 估算块间停顿秒数
+        /// 估算块间停顿秒数。
+        /// 对应 Python estimate_voice_clone_inter_chunk_pause_seconds：
+        /// 用 str.split() 按**任意空白**切分，因此这里也要带上 \t\n\r，
+        /// 否则含制表符/换行的文本会被算成 1 个词、错走短停顿分支。
         /// </summary>
         public static float EstimateInterChunkPauseSeconds(string textChunk)
         {
-            int wordCount = textChunk?.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).Length ?? 0;
+            int wordCount = textChunk?.Trim().Split(
+                new[] { ' ', '\t', '\n', '\r', '\f', '\v' },
+                StringSplitOptions.RemoveEmptyEntries).Length ?? 0;
             return wordCount <= 4 ? DefaultInterChunkPauseShortSec : DefaultInterChunkPauseLongSec;
         }
     }

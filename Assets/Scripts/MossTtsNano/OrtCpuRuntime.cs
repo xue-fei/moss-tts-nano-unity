@@ -247,12 +247,20 @@ namespace MossTtsNano
                 }
                 else if (_engine.HasLocalCachedStep)
                 {
-                    // 本地缓存步 - 逐通道采样
+                    // 本地缓存步 - 逐通道采样。
+                    //
+                    // localPast 必须在每次调用后被返回值覆盖：local_cached_step 是
+                    // 带 KV cache 的自回归会话，第 k 次调用要看到前 k-1 步的 key/value。
+                    // 原实现把第 2 次调用的 nextPast2 固定喂给后续 15 个通道，
+                    // 而 past_valid_lengths 仍逐步 +1，等于告诉模型"缓存里有 j 个
+                    // 有效位置"但实际只给了 2 个，注意力读到的是未初始化区域。
+                    // 对应 Python 的 local_past_by_name = ... 每步重新赋值。
                     var localPast = CreateEmptyLocalCachedPast();
                     int localPastValidLength = 0;
 
-                    var (textLogits, _, nextPast) = _engine.LocalCachedStep(
+                    var (textLogits, _, pastAfterProbe) = _engine.LocalCachedStep(
                         globalHidden, 0, 0, 0, 0, localPastValidLength, localPast);
+                    localPast = pastAfterProbe;
                     localPastValidLength++;
 
                     int nextTextToken = MossTtsMath.SampleAssistantTextToken(
@@ -265,8 +273,9 @@ namespace MossTtsNano
                     if (nextTextToken != _manifest.tts_config.audio_assistant_slot_token_id)
                         break;
 
-                    var (textLogits2, audioLogits, nextPast2) = _engine.LocalCachedStep(
-                        globalHidden, nextTextToken, 0, 0, 1, localPastValidLength, nextPast);
+                    var (_, audioLogits, pastAfterSlot) = _engine.LocalCachedStep(
+                        globalHidden, nextTextToken, 0, 0, 1, localPastValidLength, localPast);
+                    localPast = pastAfterSlot;
                     localPastValidLength++;
 
                     float[] firstChannelLogits = _engine.SliceAudioChannelLogits(audioLogits, 0, _nVq, _codebookSize);
@@ -283,8 +292,9 @@ namespace MossTtsNano
                     int previousToken = sampledToken;
                     for (int ch = 1; ch < _nVq; ch++)
                     {
-                        var (tLogits, aLogits, nPast) = _engine.LocalCachedStep(
-                            globalHidden, 0, previousToken, ch - 1, 2, localPastValidLength, nextPast2);
+                        var (_, aLogits, pastAfterChannel) = _engine.LocalCachedStep(
+                            globalHidden, 0, previousToken, ch - 1, 2, localPastValidLength, localPast);
+                        localPast = pastAfterChannel;
                         localPastValidLength++;
 
                         float[] channelLogits = _engine.SliceAudioChannelLogits(aLogits, ch, _nVq, _codebookSize);

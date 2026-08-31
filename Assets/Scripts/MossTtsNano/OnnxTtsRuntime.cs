@@ -18,6 +18,16 @@ namespace MossTtsNano
         private readonly Dictionary<string, List<int[]>> _voiceCache;
         private ITokenizer _tokenizer;
 
+        /// <summary>
+        /// 是否压缩退化静音段（<see cref="SilentFrameGuard"/>）。
+        ///
+        /// 原版 Python 没有这一步。它是分词器出错时期加的补偿：当时全角标点被拆成
+        /// byte-fallback token，模型收到偏离训练分布的输入后会连续几十帧输出静音
+        /// token。分词器与官方 sentencepiece 对齐后根因已消除，而丢帧本身会压缩
+        /// 时间轴、削掉正常句读停顿，所以默认关闭；仅在排查退化时临时打开。
+        /// </summary>
+        public bool CollapseDegenerateSilence { get; set; } = false;
+
         public OnnxTtsRuntime(
             string modelDir,
             int threadCount = 4,
@@ -43,32 +53,38 @@ namespace MossTtsNano
 
         private void InitializeTokenizer(string modelDir)
         {
-            // 词表与模型同目录（StreamingAssets/Models/MOSS-TTS-Nano-ONNX/）
-            string[] candidatePaths = {
-                Path.Combine(_modelDir, "tokenizer_vocab_parallel.json"),
-                Path.Combine(_modelDir, "tokenizer.model")
-            };
+            // tokenizer_sp.json + tokenizer_charsmap.bytes 与模型同目录，
+            // 由 MOSS-TTS-Nano/export_tokenizer_assets.py 从 tokenizer.model 导出。
+            // 旧的 tokenizer_vocab_parallel.json 只有 pieces/scores，缺 types 与
+            // nmt_nfkc 归一化规则表，无法复现官方切分，已不再使用。
+            string spJsonPath = Path.GetFullPath(Path.Combine(_modelDir, "tokenizer_sp.json"));
 
-            foreach (var path in candidatePaths)
+            if (File.Exists(spJsonPath))
             {
-                string fullPath = Path.GetFullPath(path);
-                if (File.Exists(fullPath))
+                try
                 {
-                    try
-                    {
-                        _tokenizer = new SentencePieceTokenizer(fullPath);
-                        Debug.Log($"[OnnxTtsRuntime] Tokenizer loaded from {fullPath}");
-                        return;
-                    }
-                    catch (Exception e)
-                    {
-                        Debug.LogWarning($"[OnnxTtsRuntime] Failed to load tokenizer from {fullPath}: {e.Message}");
-                    }
+                    _tokenizer = new SentencePieceTokenizer(spJsonPath);
+                    Debug.Log($"[OnnxTtsRuntime] Tokenizer loaded from {spJsonPath}");
+                    return;
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"[OnnxTtsRuntime] Failed to load tokenizer from {spJsonPath}: {e}");
                 }
             }
+            else
+            {
+                Debug.LogError(
+                    $"[OnnxTtsRuntime] {spJsonPath} not found. Generate it with:\n" +
+                    "  python MOSS-TTS-Nano/export_tokenizer_assets.py " +
+                    "<model_dir>/tokenizer.model <model_dir>");
+            }
 
-            // 回退到简单 Unicode 分词器（仅用于测试）
-            Debug.LogWarning("[OnnxTtsRuntime] SentencePiece tokenizer not found, falling back to simple Unicode tokenizer");
+            // 回退分词器的 id 与模型词表毫无关系，合成结果必然是噪声，
+            // 这里明确告知而不是让它静默产出坏音频。
+            Debug.LogError(
+                "[OnnxTtsRuntime] Falling back to SimpleUnicodeTokenizer — " +
+                "synthesized audio WILL be wrong until the SentencePiece assets are present.");
             _tokenizer = new SimpleUnicodeTokenizer();
         }
 
@@ -225,13 +241,18 @@ namespace MossTtsNano
                     return (Array.Empty<float>(), generatedFrames);
                 }
 
-                // 模型偶发退化会连续几十帧把 ch0 采到静音 token，解码出来就是中间的大段空白。
-                // 这里只截断静音段、不动有声帧，因此不会截掉任何语音内容。
-                List<int[]> decodeFrames = SilentFrameGuard.Collapse(generatedFrames);
-                if (decodeFrames.Count != generatedFrames.Count)
+                // 静音段压缩是 C# 独有的补丁，原版 Python 没有对应逻辑。
+                // 它当初是为了掩盖分词错误导致的大段空白；分词修正后不再需要，
+                // 而且丢帧会改变时间轴、削掉正常句读停顿，所以默认关闭。
+                List<int[]> decodeFrames = generatedFrames;
+                if (CollapseDegenerateSilence)
                 {
-                    Debug.Log($"[OnnxTtsRuntime] Collapsed degenerate silence: " +
-                              $"{generatedFrames.Count} -> {decodeFrames.Count} frames");
+                    decodeFrames = SilentFrameGuard.Collapse(generatedFrames);
+                    if (decodeFrames.Count != generatedFrames.Count)
+                    {
+                        Debug.Log($"[OnnxTtsRuntime] Collapsed degenerate silence: " +
+                                  $"{generatedFrames.Count} -> {decodeFrames.Count} frames");
+                    }
                 }
 
                 var (channelArrays, audioLength) = _engine.CodecDecode(decodeFrames);
@@ -240,55 +261,59 @@ namespace MossTtsNano
                 return (waveform, generatedFrames);
             }
 
-            // 流式合成
+            // 流式合成，对齐 Python synthesize_single_chunk 的 streaming 分支
             var emittedChunks = new List<float[]>();
             int emittedSamplesTotal = 0;
             float? firstAudioEmittedAt = null;
             var pendingDecodeFrames = new List<int[]>();
-            int silentRun = 0;
 
             // 每个 chunk 独立的流式解码状态，避免跨 chunk 缓存串味
             _engine.CodecDecodeStepReset();
 
-            void OnFrame(List<int[]> frames, int step, int[] frame)
+            // 对应 Python 的 decode_pending_frames(force)
+            void DecodePendingFrames(bool force)
             {
-                // 与非流式路径一致地截断退化静音段。注意这里只影响送进 codec 的帧，
-                // LM 的 KV cache / repetition mask 仍由 GenerateAudioFrames 按真实轨迹推进。
-                silentRun = SilentFrameGuard.Advance(frame, silentRun);
-                if (!SilentFrameGuard.ShouldEmit(frame, silentRun))
-                    return;
-
-                // 只解码尚未消费的新帧，否则每次回调都会把历史帧重复解码一遍
-                pendingDecodeFrames.Add(frame);
+                int pendingCount = pendingDecodeFrames.Count;
+                if (pendingCount <= 0) return;
 
                 int decodeBudget = Math.Max(1, ResolveStreamDecodeFrameBudget(
                     emittedSamplesTotal, _codecMeta.codec_config.sample_rate, firstAudioEmittedAt));
 
-                if (pendingDecodeFrames.Count < decodeBudget)
-                    return;
+                if (!force && pendingCount < decodeBudget) return;
 
-                var (audio, audioLength) = _engine.CodecDecodeStep(pendingDecodeFrames);
-                pendingDecodeFrames.Clear();
+                // 只取 budget 内的帧，剩下的留在队列里下次再解。
+                // 原来用 Clear() 会把超出 budget 的帧也一并交给有状态的
+                // decode_step，等价于跳过了它们的时序位置。
+                int frameBudget = force ? pendingCount : Math.Min(pendingCount, decodeBudget);
+                var frameChunk = pendingDecodeFrames.GetRange(0, frameBudget);
+                pendingDecodeFrames.RemoveRange(0, frameBudget);
 
-                if (audioLength > 0)
-                {
-                    if (!firstAudioEmittedAt.HasValue)
-                        firstAudioEmittedAt = Time.realtimeSinceStartup;
+                var (audio, audioLength) = _engine.CodecDecodeStep(frameChunk);
+                if (audioLength <= 0) return;
 
-                    emittedSamplesTotal += audioLength;
-                    emittedChunks.Add(audio);
-                }
+                if (!firstAudioEmittedAt.HasValue)
+                    firstAudioEmittedAt = Time.realtimeSinceStartup;
+
+                emittedSamplesTotal += audioLength;
+                emittedChunks.Add(audio);
             }
 
-            generatedFrames = GenerateAudioFrames((inputIds, attentionMask), OnFrame);
-
-            // 刷新残留的未解码帧（不是重新解码全部帧）
-            if (pendingDecodeFrames.Count > 0)
+            void OnFrame(List<int[]> frames, int step, int[] frame)
             {
-                var (audio, audioLength) = _engine.CodecDecodeStep(pendingDecodeFrames);
-                pendingDecodeFrames.Clear();
-                if (audioLength > 0)
-                    emittedChunks.Add(audio);
+                // Python 是 pending_decode_frames.append(list(frame))，即存副本。
+                // 直接存引用的话，上游若复用同一数组，队列里的帧会被后续步骤改写。
+                pendingDecodeFrames.Add((int[])frame.Clone());
+                DecodePendingFrames(false);
+            }
+
+            try
+            {
+                generatedFrames = GenerateAudioFrames((inputIds, attentionMask), OnFrame);
+                DecodePendingFrames(true);
+            }
+            finally
+            {
+                _engine.CodecDecodeStepReset();
             }
 
             waveform = ConcatWaveforms(emittedChunks);
@@ -428,40 +453,60 @@ namespace MossTtsNano
                 var pendingDecodeFrames = new List<int[]>();
                 _engine.CodecDecodeStepReset();
 
-                void OnFrame(List<int[]> frames, int step, int[] frame)
+                // 与 SynthesizeSingleChunk 一致的 pending 队列语义：
+                // decode_step 是有状态会话，必须按 budget 分批消费、消费后移除。
+                void DecodePendingFrames(bool force)
                 {
-                    pendingDecodeFrames.Add(frame);
-                    int decodeBudget = ResolveStreamDecodeFrameBudget(emittedSamplesTotal, sampleRate, firstAudioEmittedAt);
+                    int pendingCount = pendingDecodeFrames.Count;
+                    if (pendingCount <= 0) return;
 
-                    if (pendingDecodeFrames.Count >= Math.Max(1, decodeBudget))
+                    int decodeBudget = Math.Max(1, ResolveStreamDecodeFrameBudget(
+                        emittedSamplesTotal, sampleRate, firstAudioEmittedAt));
+
+                    if (!force && pendingCount < decodeBudget) return;
+
+                    int frameBudget = force ? pendingCount : Math.Min(pendingCount, decodeBudget);
+                    var frameChunk = pendingDecodeFrames.GetRange(0, frameBudget);
+                    pendingDecodeFrames.RemoveRange(0, frameBudget);
+
+                    var (audio, audioLength) = _engine.CodecDecodeStep(frameChunk);
+                    if (audioLength <= 0) return;
+
+                    if (!firstAudioEmittedAt.HasValue)
+                        firstAudioEmittedAt = Time.realtimeSinceStartup;
+
+                    emittedSamplesTotal += audioLength;
+
+                    float emittedSeconds = emittedSamplesTotal / (float)sampleRate;
+                    float leadSeconds = emittedSeconds - (Time.realtimeSinceStartup - firstAudioEmittedAt.Value);
+
+                    events.Add(new AudioChunkEvent
                     {
-                        var (audio, audioLength) = _engine.CodecDecodeStep(pendingDecodeFrames);
-                        pendingDecodeFrames.Clear();
-
-                        if (audioLength > 0)
-                        {
-                            if (!firstAudioEmittedAt.HasValue)
-                                firstAudioEmittedAt = Time.realtimeSinceStartup;
-
-                            emittedSamplesTotal += audioLength;
-
-                            float emittedSeconds = emittedSamplesTotal / (float)sampleRate;
-                            float leadSeconds = emittedSeconds - (Time.realtimeSinceStartup - firstAudioEmittedAt.Value);
-
-                            events.Add(new AudioChunkEvent
-                            {
-                                Waveform = audio,
-                                SampleRate = sampleRate,
-                                ChunkIndex = chunkIndex,
-                                IsPause = false,
-                                EmittedAudioSeconds = emittedSeconds,
-                                LeadSeconds = leadSeconds
-                            });
-                        }
-                    }
+                        Waveform = audio,
+                        SampleRate = sampleRate,
+                        ChunkIndex = chunkIndex,
+                        IsPause = false,
+                        EmittedAudioSeconds = emittedSeconds,
+                        LeadSeconds = leadSeconds
+                    });
                 }
 
-                GenerateAudioFrames((inputIds, attentionMask), OnFrame);
+                void OnFrame(List<int[]> frames, int step, int[] frame)
+                {
+                    pendingDecodeFrames.Add((int[])frame.Clone());
+                    DecodePendingFrames(false);
+                }
+
+                try
+                {
+                    GenerateAudioFrames((inputIds, attentionMask), OnFrame);
+                    DecodePendingFrames(true);
+                }
+                finally
+                {
+                    _engine.CodecDecodeStepReset();
+                }
+
                 chunkIndex++;
             }
 

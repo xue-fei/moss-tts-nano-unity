@@ -385,6 +385,11 @@ namespace MossTtsNano
 
             var maskTensor = BuildRepetitionMask(previousTokenSetsByChannel, _codebookSize);
 
+            // 随机数消耗顺序必须与 Python 参考实现一致：先 assistant，再 audio。
+            // 每帧 frame_s 先从 rng 取 1 个 [1] 给 assistant_random_u，再取 N_VQ 个 [1,N_VQ]
+            // 给 audio_random_u。顺序反了会让模型收到完全错的随机值，should_continue 决策都不同。
+            float assistantRandom = (float)rng.NextDouble();
+
             // 随机数缓冲同样复用，避免每帧的 LINQ 分配。
             if (_audioRandomBuffer == null || _audioRandomBuffer.Length != _nVq)
             {
@@ -393,8 +398,6 @@ namespace MossTtsNano
             }
             for (int i = 0; i < _nVq; i++)
                 _audioRandomBuffer[i] = (float)rng.NextDouble();
-
-            float assistantRandom = (float)rng.NextDouble();
 
             var globalHiddenTensor = new DenseTensor<float>(globalHidden, new[] { 1, globalHidden.Length });
             var assistantRandomTensor = new DenseTensor<float>(new[] { assistantRandom }, new[] { 1 });

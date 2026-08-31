@@ -224,9 +224,19 @@ namespace MossTtsNano
                     Debug.LogWarning($"[OnnxTtsRuntime] No audio frames generated for '{text}' (model stopped at step 0)");
                     return (Array.Empty<float>(), generatedFrames);
                 }
-                var (channelArrays, audioLength) = _engine.CodecDecode(generatedFrames);
+
+                // 模型偶发退化会连续几十帧把 ch0 采到静音 token，解码出来就是中间的大段空白。
+                // 这里只截断静音段、不动有声帧，因此不会截掉任何语音内容。
+                List<int[]> decodeFrames = SilentFrameGuard.Collapse(generatedFrames);
+                if (decodeFrames.Count != generatedFrames.Count)
+                {
+                    Debug.Log($"[OnnxTtsRuntime] Collapsed degenerate silence: " +
+                              $"{generatedFrames.Count} -> {decodeFrames.Count} frames");
+                }
+
+                var (channelArrays, audioLength) = _engine.CodecDecode(decodeFrames);
                 waveform = MergeAudioChannels(channelArrays, audioLength);
-                Debug.Log($"[OnnxTtsRuntime] Chunk done: {generatedFrames.Count} frames -> {audioLength} samples/ch");
+                Debug.Log($"[OnnxTtsRuntime] Chunk done: {decodeFrames.Count} frames -> {audioLength} samples/ch");
                 return (waveform, generatedFrames);
             }
 
@@ -235,12 +245,19 @@ namespace MossTtsNano
             int emittedSamplesTotal = 0;
             float? firstAudioEmittedAt = null;
             var pendingDecodeFrames = new List<int[]>();
+            int silentRun = 0;
 
             // 每个 chunk 独立的流式解码状态，避免跨 chunk 缓存串味
             _engine.CodecDecodeStepReset();
 
             void OnFrame(List<int[]> frames, int step, int[] frame)
             {
+                // 与非流式路径一致地截断退化静音段。注意这里只影响送进 codec 的帧，
+                // LM 的 KV cache / repetition mask 仍由 GenerateAudioFrames 按真实轨迹推进。
+                silentRun = SilentFrameGuard.Advance(frame, silentRun);
+                if (!SilentFrameGuard.ShouldEmit(frame, silentRun))
+                    return;
+
                 // 只解码尚未消费的新帧，否则每次回调都会把历史帧重复解码一遍
                 pendingDecodeFrames.Add(frame);
 

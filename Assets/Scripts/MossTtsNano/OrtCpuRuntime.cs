@@ -256,6 +256,7 @@ namespace MossTtsNano
                         globalHidden, previousTokenSetsByChannel, config.audio_repetition_penalty);
                     if (!shouldContinue) break;
                     frame = frameTokens.ToList();
+                    TrackFrameTokens(frame, previousTokensByChannel, previousTokenSetsByChannel);
                 }
                 else if (_engine.HasLocalFixedSampledFrame && config.sample_mode == SampleModeFixed)
                 {
@@ -263,6 +264,7 @@ namespace MossTtsNano
                         globalHidden, previousTokenSetsByChannel, _rng);
                     if (!shouldContinue) break;
                     frame = frameTokens.ToList();
+                    TrackFrameTokens(frame, previousTokensByChannel, previousTokenSetsByChannel);
                 }
                 else if (_engine.HasLocalCachedStep)
                 {
@@ -366,6 +368,24 @@ namespace MossTtsNano
             }
 
             return generatedFrames;
+        }
+
+        /// <summary>
+        /// 记录整帧采样结果，供后续步骤的重复惩罚使用。
+        /// 走 LocalGreedyFrame / LocalFixedSampledFrame 这类"一次出整帧"的路径时，
+        /// 采样发生在 ONNX 图内部，必须在 C# 侧手动回填历史，否则 repetition_seen_mask 永远为空。
+        /// </summary>
+        private static void TrackFrameTokens(
+            List<int> frame,
+            List<List<int>> previousTokensByChannel,
+            List<HashSet<int>> previousTokenSetsByChannel)
+        {
+            int channels = Math.Min(frame.Count, previousTokensByChannel.Count);
+            for (int ch = 0; ch < channels; ch++)
+            {
+                previousTokensByChannel[ch].Add(frame[ch]);
+                previousTokenSetsByChannel[ch].Add(frame[ch]);
+            }
         }
 
         /// <summary>

@@ -334,23 +334,39 @@ namespace MossTtsNano
         /// </summary>
         public void PlayWaveform(float[] waveform, int sampleRate, int channels)
         {
+            if (waveform == null || waveform.Length == 0)
+            {
+                Debug.LogWarning("[MossTts] PlayWaveform called with empty waveform");
+                return;
+            }
+
             if (_audioSource == null)
             {
                 _audioSource = gameObject.AddComponent<AudioSource>();
             }
 
-            AudioClip clip = AudioClip.Create("MossTtsAudio", waveform.Length / channels, channels, sampleRate, false);
-            // 转换为 float[] 并设置数据
-            float[] monowave = new float[waveform.Length / Mathf.Max(1, channels)];
-            for (int i = 0; i < monowave.Length; i++)
+            channels = Mathf.Max(1, channels);
+            int samplesPerChannel = waveform.Length / channels;
+            if (samplesPerChannel <= 0)
             {
-                // 取所有通道的平均值
-                float sum = 0f;
-                for (int c = 0; c < channels; c++)
-                    sum += waveform[i * channels + c];
-                monowave[i] = sum / channels;
+                Debug.LogWarning($"[MossTts] Waveform too short: {waveform.Length} values for {channels} channels");
+                return;
             }
-            clip.SetData(monowave, 0);
+
+            // AudioClip.SetData 要求交错排列且长度为 samplesPerChannel * channels，
+            // 因此直接写入原始交错数据，不做下混。
+            AudioClip clip = AudioClip.Create("MossTtsAudio", samplesPerChannel, channels, sampleRate, false);
+            int usable = samplesPerChannel * channels;
+            if (usable == waveform.Length)
+            {
+                clip.SetData(waveform, 0);
+            }
+            else
+            {
+                float[] trimmed = new float[usable];
+                Array.Copy(waveform, trimmed, usable);
+                clip.SetData(trimmed, 0);
+            }
 
             _audioSource.clip = clip;
             _audioSource.Play();

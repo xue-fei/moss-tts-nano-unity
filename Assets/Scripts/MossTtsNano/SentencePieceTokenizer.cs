@@ -23,6 +23,8 @@ namespace MossTtsNano
         private readonly int _vocabSize;
         private readonly HashSet<char> _vocabFirstChars;
         private readonly int _maxPieceLength;
+        private readonly int[] _byteFallbackIds;
+        private readonly bool _hasByteFallback;
 
         public int UnkId => _unkId;
         public int BosId => _bosId;
@@ -63,77 +65,53 @@ namespace MossTtsNano
             _eosId = _pieceToId.GetValueOrDefault("</s>", 2);
             _padId = _pieceToId.GetValueOrDefault("<pad>", 3);
 
-            Debug.Log($"[SentencePiece] Loaded {size} tokens, max piece length: {_maxPieceLength}");
+            // byte-fallback: 词表里未收录的字符（例如全角逗号 '，'）必须拆成 <0xNN> 片段，
+            // 否则会被当成 <unk>，模型收到无意义 token 后直接在第 0 步停止生成。
+            _byteFallbackIds = new int[256];
+            _hasByteFallback = true;
+            for (int b = 0; b < 256; b++)
+            {
+                if (_pieceToId.TryGetValue($"<0x{b:X2}>", out int id))
+                    _byteFallbackIds[b] = id;
+                else
+                {
+                    _byteFallbackIds[b] = _unkId;
+                    _hasByteFallback = false;
+                }
+            }
+
+            Debug.Log($"[SentencePiece] Loaded {size} tokens, max piece length: {_maxPieceLength}, byteFallback: {_hasByteFallback}");
         }
 
         /// <summary>
-        /// 编码文本为 token IDs - 贪心最长匹配
-        /// SentencePiece 在编码时在文本前自动添加 ▁ 前缀
+        /// 编码文本为 token IDs - 贪心最长匹配 + byte fallback
+        /// SentencePiece 会先把空格替换成 ▁ 并在句首补一个 ▁
         /// </summary>
         public List<int> Encode(string text)
         {
             if (string.IsNullOrEmpty(text))
                 return new List<int>();
 
-            // SentencePiece 在开头自动添加空格（表示为 ▁）
-            string prefixedText = "▁" + text;
+            // 空格 → ▁，并在句首补 ▁（与 manifest 的参考 token 序列一致）
+            string normalized = "\u2581" + text.Replace(' ', '\u2581');
 
             var tokenIds = new List<int>();
-            int pos = 1; // 从 1 开始，跳过虚拟的 ▁ 前缀
-            int n = prefixedText.Length;
-
-            // 处理第一个片段（包含开头的 ▁）
-            int bestLen = 0;
-            int bestId = -1;
-            float bestScore = float.MinValue;
-
-            int maxLen = Math.Min(n, _maxPieceLength);
-            for (int len = 1; len <= maxLen; len++)
-            {
-                string candidate = prefixedText.Substring(0, len);
-                if (_pieceToId.TryGetValue(candidate, out int pieceId))
-                {
-                    float score = _idToScore[pieceId];
-                    if (len > bestLen || (len == bestLen && score > bestScore))
-                    {
-                        bestLen = len;
-                        bestId = pieceId;
-                        bestScore = score;
-                    }
-                }
-            }
-
-            if (bestId >= 0)
-            {
-                tokenIds.Add(bestId);
-                pos = bestLen;
-            }
-            else
-            {
-                tokenIds.Add(_unkId);
-                pos = 1;
-            }
+            int pos = 0;
+            int n = normalized.Length;
 
             while (pos < n)
             {
-                // 尝试匹配最长的片段
-                bestLen = 0;
-                bestId = -1;
-                bestScore = float.MinValue;
+                int bestLen = 0;
+                int bestId = -1;
 
-                maxLen = Math.Min(n - pos, _maxPieceLength);
-                for (int len = 1; len <= maxLen; len++)
+                int maxLen = Math.Min(n - pos, _maxPieceLength);
+                for (int len = maxLen; len >= 1; len--)
                 {
-                    string candidate = prefixedText.Substring(pos, len);
-                    if (_pieceToId.TryGetValue(candidate, out int pieceId))
+                    if (_pieceToId.TryGetValue(normalized.Substring(pos, len), out int pieceId))
                     {
-                        float score = _idToScore[pieceId];
-                        if (len > bestLen || (len == bestLen && score > bestScore))
-                        {
-                            bestLen = len;
-                            bestId = pieceId;
-                            bestScore = score;
-                        }
+                        bestLen = len;
+                        bestId = pieceId;
+                        break;
                     }
                 }
 
@@ -141,16 +119,35 @@ namespace MossTtsNano
                 {
                     tokenIds.Add(bestId);
                     pos += bestLen;
+                    continue;
                 }
-                else
-                {
-                    // 无法匹配，使用 UNK
-                    tokenIds.Add(_unkId);
-                    pos += 1;
-                }
+
+                // 未收录的字符（例如全角逗号 '，'）走 UTF-8 字节回退，
+                // 直接吐 <unk> 会让模型在第一步就判定结束、生成 0 帧音频。
+                AppendByteFallback(tokenIds, normalized, pos, out int consumed);
+                pos += consumed;
             }
 
             return tokenIds;
+        }
+
+        /// <summary>
+        /// 将一个码位（含代理对）按 UTF-8 字节展开为 &lt;0xNN&gt; token
+        /// </summary>
+        private void AppendByteFallback(List<int> tokenIds, string text, int pos, out int consumed)
+        {
+            consumed = char.IsHighSurrogate(text[pos]) && pos + 1 < text.Length &&
+                       char.IsLowSurrogate(text[pos + 1]) ? 2 : 1;
+
+            if (!_hasByteFallback)
+            {
+                tokenIds.Add(_unkId);
+                return;
+            }
+
+            byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(text.Substring(pos, consumed));
+            foreach (byte b in utf8)
+                tokenIds.Add(_byteFallbackIds[b]);
         }
 
         public string Decode(List<int> tokenIds)

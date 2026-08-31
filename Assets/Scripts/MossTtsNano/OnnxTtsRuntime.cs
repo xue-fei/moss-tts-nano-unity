@@ -24,11 +24,11 @@ namespace MossTtsNano
             int? maxNewFrames = null,
             bool? doSample = null,
             string sampleMode = null,
-            string executionProvider = "cpu",
+            string executionProvider = "cuda",
             string outputDir = null)
             : base(modelDir, threadCount, maxNewFrames, doSample, sampleMode, executionProvider)
         {
-            _outputDir = outputDir ?? Path.Combine(Application.persistentDataPath, "MossTtsOutput");
+            _outputDir = Path.Combine(Application.dataPath, "MossTtsOutput");
             Directory.CreateDirectory(_outputDir);
             _tokenCache = new Dictionary<string, int>();
             _voiceCache = new Dictionary<string, List<int[]>>();
@@ -216,8 +216,14 @@ namespace MossTtsNano
             if (!streaming)
             {
                 generatedFrames = GenerateAudioFrames((inputIds, attentionMask));
+                if (generatedFrames.Count == 0)
+                {
+                    Debug.LogWarning($"[OnnxTtsRuntime] No audio frames generated for '{text}' (model stopped at step 0)");
+                    return (Array.Empty<float>(), generatedFrames);
+                }
                 var (channelArrays, audioLength) = _engine.CodecDecode(generatedFrames);
                 waveform = MergeAudioChannels(channelArrays, audioLength);
+                Debug.Log($"[OnnxTtsRuntime] Chunk done: {generatedFrames.Count} frames -> {audioLength} samples/ch");
                 return (waveform, generatedFrames);
             }
 
@@ -225,33 +231,42 @@ namespace MossTtsNano
             var emittedChunks = new List<float[]>();
             int emittedSamplesTotal = 0;
             float? firstAudioEmittedAt = null;
+            var pendingDecodeFrames = new List<int[]>();
+
+            // 每个 chunk 独立的流式解码状态，避免跨 chunk 缓存串味
+            _engine.CodecDecodeStepReset();
 
             void OnFrame(List<int[]> frames, int step, int[] frame)
             {
-                // 增量解码
-                int decodeBudget = ResolveStreamDecodeFrameBudget(
-                    emittedSamplesTotal, _codecMeta.codec_config.sample_rate, firstAudioEmittedAt);
+                // 只解码尚未消费的新帧，否则每次回调都会把历史帧重复解码一遍
+                pendingDecodeFrames.Add(frame);
 
-                if (frames.Count >= decodeBudget)
+                int decodeBudget = Math.Max(1, ResolveStreamDecodeFrameBudget(
+                    emittedSamplesTotal, _codecMeta.codec_config.sample_rate, firstAudioEmittedAt));
+
+                if (pendingDecodeFrames.Count < decodeBudget)
+                    return;
+
+                var (audio, audioLength) = _engine.CodecDecodeStep(pendingDecodeFrames);
+                pendingDecodeFrames.Clear();
+
+                if (audioLength > 0)
                 {
-                    var (audio, audioLength) = _engine.CodecDecodeStep(frames);
-                    if (audioLength > 0)
-                    {
-                        if (!firstAudioEmittedAt.HasValue)
-                            firstAudioEmittedAt = Time.realtimeSinceStartup;
+                    if (!firstAudioEmittedAt.HasValue)
+                        firstAudioEmittedAt = Time.realtimeSinceStartup;
 
-                        emittedSamplesTotal += audioLength;
-                        emittedChunks.Add(audio);
-                    }
+                    emittedSamplesTotal += audioLength;
+                    emittedChunks.Add(audio);
                 }
             }
 
             generatedFrames = GenerateAudioFrames((inputIds, attentionMask), OnFrame);
 
-            // 刷新剩余帧
-            if (generatedFrames.Count > 0)
+            // 刷新残留的未解码帧（不是重新解码全部帧）
+            if (pendingDecodeFrames.Count > 0)
             {
-                var (audio, audioLength) = _engine.CodecDecodeStep(generatedFrames);
+                var (audio, audioLength) = _engine.CodecDecodeStep(pendingDecodeFrames);
+                pendingDecodeFrames.Clear();
                 if (audioLength > 0)
                     emittedChunks.Add(audio);
             }
@@ -391,6 +406,7 @@ namespace MossTtsNano
                 var (inputIds, attentionMask) = BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIds);
 
                 var pendingDecodeFrames = new List<int[]>();
+                _engine.CodecDecodeStepReset();
 
                 void OnFrame(List<int[]> frames, int step, int[] frame)
                 {

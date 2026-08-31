@@ -40,6 +40,14 @@ namespace MossTtsNano
         private int _threadCount;
         private bool _disposed;
 
+        // KV cache 布局: [batch, seq, heads, headDim]
+        private int _globalKvStride;   // global_heads * head_dim
+        private int _localKvStride;    // local_heads * local_head_dim
+        private int _globalHeads;
+        private int _globalHeadDim;
+        private int _localHeads;
+        private int _localHeadDim;
+
         private Dictionary<string, NamedOnnxValue> _streamingInputs;
 
         public void LoadManifest(string manifestPath)
@@ -67,6 +75,15 @@ namespace MossTtsNano
 
             Debug.Log($"[OnnxRuntime] Manifest loaded: {_manifest.builtin_voices?.Length} voices, nVq={_nVq}, codebook={_codebookSize}");
             Debug.Log($"[OnnxRuntime] prompt_templates: {(_manifest.prompt_templates != null ? "OK" : "NULL")}");
+
+            // KV cache 形状信息: [batch, seq, heads, headDim]
+            var mc = _ttsMeta.model_config;
+            _globalHeads = mc.global_heads;
+            _globalHeadDim = mc.head_dim;
+            _localHeads = mc.local_heads;
+            _localHeadDim = mc.local_head_dim;
+            _globalKvStride = Math.Max(1, _globalHeads * _globalHeadDim);
+            _localKvStride = Math.Max(1, _localHeads * _localHeadDim);
         }
 
         public void InitializeSessions(int threadCount = 4)
@@ -148,6 +165,43 @@ namespace MossTtsNano
             return new DenseTensor<T>(data, shape);
         }
 
+        /// <summary>
+        /// 把扁平 KV cache 还原成 [1, seq, heads, headDim] 四维张量。
+        /// decode_step / local_cached_step 的 past_* 输入都是 4 维，
+        /// 用 [1, N] 二维会直接被 ORT 判为 shape mismatch。
+        /// </summary>
+        private DenseTensor<float> MakeKvTensor(float[] data, int heads, int headDim)
+        {
+            int stride = Math.Max(1, heads * headDim);
+            int seq = data.Length / stride;
+            return new DenseTensor<float>(data, new[] { 1, seq, heads, headDim });
+        }
+
+        /// <summary>
+        /// 读取 int32 标志位输出。ONNX 导出的 should_continue 是 INT32 而非 BOOL，
+        /// 用 AsTensor&lt;bool&gt;() 会静默返回 null 并在后续解引用时抛 NullReferenceException。
+        /// </summary>
+        private static bool ReadFlag(IReadOnlyCollection<DisposableNamedOnnxValue> results, string name)
+        {
+            var value = results.FirstOrDefault(r => r.Name == name);
+            if (value == null)
+                throw new InvalidOperationException($"[OnnxRuntime] Output '{name}' not found");
+
+            var intTensor = value.AsTensor<int>();
+            if (intTensor != null)
+                return intTensor.GetValue(0) != 0;
+
+            var longTensor = value.AsTensor<long>();
+            if (longTensor != null)
+                return longTensor.GetValue(0) != 0;
+
+            var boolTensor = value.AsTensor<bool>();
+            if (boolTensor != null)
+                return boolTensor.GetValue(0);
+
+            throw new InvalidOperationException($"[OnnxRuntime] Unsupported tensor type for output '{name}'");
+        }
+
         public (float[] globalHidden, Dictionary<string, float[]> pastStates, int pastValidLength) Prefill(
             int[,,] inputIds, int[,] attentionMask)
         {
@@ -206,7 +260,7 @@ namespace MossTtsNano
 
             foreach (var kvp in pastStates)
             {
-                var pastTensor = new DenseTensor<float>(kvp.Value, new[] { 1, kvp.Value.Length });
+                var pastTensor = MakeKvTensor(kvp.Value, _globalHeads, _globalHeadDim);
                 inputs.Add(NamedOnnxValue.CreateFromTensor(kvp.Key, pastTensor));
             }
 
@@ -292,7 +346,7 @@ namespace MossTtsNano
 
             using var results = _localGreedyFrameSession.Run(inputs);
 
-            bool shouldContinue = TensorToArray(results.First(r => r.Name == "should_continue").AsTensor<bool>())[0];
+            bool shouldContinue = ReadFlag(results, "should_continue");
             int[] frameTokenIds = TensorToArray(results.First(r => r.Name == "frame_token_ids").AsTensor<int>());
 
             return (shouldContinue, frameTokenIds);
@@ -334,7 +388,7 @@ namespace MossTtsNano
 
             using var results = _localFixedSampledFrameSession.Run(inputs);
 
-            bool shouldContinue = TensorToArray(results.First(r => r.Name == "should_continue").AsTensor<bool>())[0];
+            bool shouldContinue = ReadFlag(results, "should_continue");
             int[] frameTokenIds = TensorToArray(results.First(r => r.Name == "frame_token_ids").AsTensor<int>());
 
             return (shouldContinue, frameTokenIds);
@@ -367,7 +421,7 @@ namespace MossTtsNano
 
             foreach (var kvp in localPastByName)
             {
-                var pastTensor = new DenseTensor<float>(kvp.Value, new[] { 1, kvp.Value.Length });
+                var pastTensor = MakeKvTensor(kvp.Value, _localHeads, _localHeadDim);
                 inputs.Add(NamedOnnxValue.CreateFromTensor(kvp.Key, pastTensor));
             }
 
@@ -432,17 +486,18 @@ namespace MossTtsNano
             var lengthsOutput = results.First(r => r.Name == "audio_lengths").AsTensor<int>();
             int audioLength = TensorToArray(lengthsOutput)[0];
 
-            int channels = _codecMeta.codec_config.channels;
+            // audio 形状为 [batch, channels, audio_length]（通道优先），不是交错排列
             var audioData = TensorToArray(audioTensor);
-            var channelArrays = new float[channels][];
+            var dims = audioTensor.Dimensions;
+            int channels = dims.Length >= 3 ? dims[1] : _codecMeta.codec_config.channels;
+            int frameStride = dims.Length >= 3 ? dims[dims.Length - 1] : audioLength;
+            audioLength = Math.Min(audioLength, frameStride);
 
+            var channelArrays = new float[channels][];
             for (int c = 0; c < channels; c++)
             {
                 channelArrays[c] = new float[audioLength];
-                for (int s = 0; s < audioLength; s++)
-                {
-                    channelArrays[c][s] = audioData[s * channels + c];
-                }
+                Array.Copy(audioData, c * frameStride, channelArrays[c], 0, audioLength);
             }
 
             return (channelArrays, audioLength);
@@ -486,7 +541,17 @@ namespace MossTtsNano
             var lengthsOutput = results.First(r => r.Name == "audio_lengths").AsTensor<int>();
             int audioLength = TensorToArray(lengthsOutput)[0];
 
-            float[] audio = TensorToArray(audioTensor);
+            // 输出是 [batch, channels, audio_length]（平面排列），调用方期望交错排列
+            var planar = TensorToArray(audioTensor);
+            var dims = audioTensor.Dimensions;
+            int channels = dims.Length >= 3 ? dims[1] : _codecMeta.codec_config.channels;
+            int frameStride = dims.Length >= 3 ? dims[dims.Length - 1] : audioLength;
+            audioLength = Math.Min(audioLength, frameStride);
+
+            float[] audio = new float[audioLength * channels];
+            for (int c = 0; c < channels; c++)
+                for (int s = 0; s < audioLength; s++)
+                    audio[s * channels + c] = planar[c * frameStride + s];
 
             UpdateStreamingStates(results);
 

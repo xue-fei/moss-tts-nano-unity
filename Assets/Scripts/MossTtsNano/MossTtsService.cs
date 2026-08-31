@@ -30,7 +30,7 @@ namespace MossTtsNano
             string modelDir,
             string outputDir = null,
             int threadCount = 4,
-            string executionProvider = "cpu")
+            string executionProvider = "cuda")
         {
             _modelDir = modelDir;
             _outputDir = outputDir ?? Path.Combine(Application.persistentDataPath, "MossTtsOutput");

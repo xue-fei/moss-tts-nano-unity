@@ -6,7 +6,7 @@ namespace MossTtsNano
 {
     /// <summary>
     /// 推理引擎接口 - 封装 ONNX 模型推理
-    /// 可接入 Barracuda、OnnxRuntime 或其他后端
+    /// 当前后端：ONNX Runtime
     /// </summary>
     public interface IInferenceEngine : IDisposable
     {
@@ -113,7 +113,7 @@ namespace MossTtsNano
         void CodecDecodeStepReset();
 
         /// <summary>
-        /// 初始化所有推理会话（ONNX Runtime 专用）
+        /// 初始化所有推理会话
         /// </summary>
         void InitializeSessions(int threadCount = 4);
     }
@@ -123,17 +123,15 @@ namespace MossTtsNano
     /// </summary>
     public static class InferenceEngineFactory
     {
-        public static IInferenceEngine Create(string backend = "onnxruntime")
+        public const string BackendOnnxRuntime = "onnxruntime";
+
+        public static IInferenceEngine Create(string backend = BackendOnnxRuntime)
         {
-            switch (backend.ToLower())
-            {
-                case "onnxruntime":
-                    return new OnnxRuntimeEngine();
-                case "barracuda":
-                    return new BarracudaInferenceEngine();
-                default:
-                    throw new ArgumentException($"Unknown backend: {backend}");
-            }
+            if (string.IsNullOrEmpty(backend) ||
+                backend.Equals(BackendOnnxRuntime, StringComparison.OrdinalIgnoreCase))
+                return new OnnxRuntimeEngine();
+
+            throw new ArgumentException($"Unknown backend: {backend}. Only '{BackendOnnxRuntime}' is supported.");
         }
     }
 }

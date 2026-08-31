@@ -115,7 +115,14 @@ namespace MossTtsNano
         /// <summary>
         /// 初始化所有推理会话
         /// </summary>
-        void InitializeSessions(int threadCount = 4);
+        /// <param name="threadCount">CPU 后端的 intra-op 线程数；CUDA 后端下基本无影响</param>
+        /// <param name="executionProvider">"cpu" 或 "cuda"。传 "cuda" 时若 EP 注册失败会自动回退到 CPU</param>
+        void InitializeSessions(int threadCount = 4, string executionProvider = "cpu");
+
+        /// <summary>
+        /// 实际生效的执行提供者。请求 cuda 但注册失败时，这里会是 "cpu"。
+        /// </summary>
+        string ActiveExecutionProvider { get; }
     }
 
     /// <summary>

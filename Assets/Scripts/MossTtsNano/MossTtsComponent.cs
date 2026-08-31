@@ -185,7 +185,17 @@ namespace MossTtsNano
                 _service = new MossTtsService(modelDir, outputDir, ThreadCount, ExecutionProvider);
                 _service.LoadModel();
                 OnModelLoaded?.Invoke();
-                Debug.Log($"[MossTts] Model loaded from {modelDir}");
+
+                // 明确区分"请求的 EP"和"实际生效的 EP"。CUDA 注册失败会静默回退到 CPU，
+                // 只看 Inspector 上的 ExecutionProvider 字段会误以为在用 GPU。
+                string activeEp = _service.ActiveExecutionProvider;
+                if (!string.Equals(activeEp, ExecutionProvider, StringComparison.OrdinalIgnoreCase))
+                {
+                    Debug.LogWarning(
+                        $"[MossTts] Requested EP '{ExecutionProvider}' but running on '{activeEp}'. " +
+                        "CUDA 需要 onnxruntime-cuda 包的原生库 + 匹配的 CUDA Toolkit/cuDNN 在 PATH 里。");
+                }
+                Debug.Log($"[MossTts] Model loaded from {modelDir} (EP={activeEp})");
             }
             catch (Exception e)
             {

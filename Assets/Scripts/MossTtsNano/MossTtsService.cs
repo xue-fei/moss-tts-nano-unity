@@ -26,6 +26,12 @@ namespace MossTtsNano
         public bool IsLoaded => _isLoaded;
         public ModelManifest Manifest => _runtime?.Manifest;
 
+        /// <summary>
+        /// 实际生效的执行提供者（"cpu" / "cuda"）。加载前为 null。
+        /// 请求 cuda 但 EP 注册失败时会是 "cpu"。
+        /// </summary>
+        public string ActiveExecutionProvider => _runtime?.ActiveExecutionProvider;
+
         public MossTtsService(
             string modelDir,
             string outputDir = null,
@@ -56,7 +62,7 @@ namespace MossTtsNano
                     outputDir: _outputDir);
 
                 _isLoaded = true;
-                Debug.Log($"[MossTts] Model loaded from {_modelDir}");
+                Debug.Log($"[MossTts] Model loaded from {_modelDir} (EP={_runtime.ActiveExecutionProvider})");
             }
         }
 

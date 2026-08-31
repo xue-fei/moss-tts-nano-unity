@@ -27,6 +27,11 @@ namespace MossTtsNano
         protected string _codecDir;
         protected int _threadCount;
         protected string _executionProvider;
+
+        /// <summary>
+        /// 实际生效的执行提供者（"cpu" / "cuda"）。请求 cuda 但 EP 注册失败时这里是 "cpu"。
+        /// </summary>
+        public string ActiveExecutionProvider => _executionProvider;
         protected int _nVq;
         protected int _codebookSize;
         protected System.Random _rng;
@@ -71,7 +76,11 @@ namespace MossTtsNano
             // 创建推理引擎
             _engine = InferenceEngineFactory.Create("onnxruntime");
             _engine.LoadManifest(Path.Combine(_modelDir, "browser_poc_manifest.json"));
-            _engine.InitializeSessions(threadCount);
+            _engine.InitializeSessions(threadCount, _executionProvider);
+
+            // EP 注册失败会静默回退，这里把实际生效的后端同步回来，
+            // 免得日志和 Inspector 显示的是"请求值"而不是"生效值"。
+            _executionProvider = _engine.ActiveExecutionProvider;
         }
 
         private void LoadManifest()

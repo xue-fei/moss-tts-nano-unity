@@ -19,6 +19,12 @@ namespace MossTtsNano
         public bool HasLocalFixedSampledFrame => _localFixedSampledFrameSession != null;
         public bool HasLocalCachedStep => _localCachedStepSession != null;
 
+        /// <summary>
+        /// 实际生效的执行提供者。请求 cuda 但 EP 注册失败（缺 onnxruntime_providers_cuda.dll /
+        /// CUDA Toolkit / cuDNN，或显存不足）时会回退成 "cpu"。
+        /// </summary>
+        public string ActiveExecutionProvider { get; private set; } = "cpu";
+
         private InferenceSession _prefillSession;
         private InferenceSession _decodeSession;
         private InferenceSession _localDecoderSession;
@@ -95,10 +101,10 @@ namespace MossTtsNano
             _localKvStride = Math.Max(1, _localHeads * _localHeadDim);
         }
 
-        public void InitializeSessions(int threadCount = 4)
+        public void InitializeSessions(int threadCount = 4, string executionProvider = "cpu")
         {
             _threadCount = threadCount;
-            var sessionOptions = CreateSessionOptions(threadCount);
+            var sessionOptions = CreateSessionOptions(threadCount, executionProvider);
 
             _prefillSession = LoadSession(sessionOptions, _ttsDir, _ttsMeta.files.prefill);
             _decodeSession = LoadSession(sessionOptions, _ttsDir, _ttsMeta.files.decode_step);
@@ -117,18 +123,47 @@ namespace MossTtsNano
 
             InitializeStreamingState();
 
-            Debug.Log("[OnnxRuntime] All inference sessions initialized");
+            Debug.Log($"[OnnxRuntime] All inference sessions initialized (EP={ActiveExecutionProvider})");
         }
 
-        private SessionOptions CreateSessionOptions(int threadCount)
+        /// <summary>
+        /// 构造 SessionOptions。请求 cuda 时尝试注册 CUDA EP，失败则打警告并退回纯 CPU，
+        /// 不让整个加载流程因为缺 CUDA 依赖而崩掉。
+        /// </summary>
+        private SessionOptions CreateSessionOptions(int threadCount, string executionProvider)
         {
-            return new SessionOptions
+            var options = new SessionOptions
             {
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
                 ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
                 InterOpNumThreads = 1,
                 IntraOpNumThreads = threadCount
             };
+
+            string ep = executionProvider?.Trim().ToLowerInvariant();
+            bool wantCuda = ep == "cuda" || ep == "gpu" || ep == "cudaexecutionprovider";
+            if (!wantCuda)
+            {
+                ActiveExecutionProvider = "cpu";
+                return options;
+            }
+
+            try
+            {
+                // CUDA EP 排在 CPU 之前，未被 CUDA 覆盖的算子仍由 CPU 兜底。
+                options.AppendExecutionProvider_CUDA(0);
+                ActiveExecutionProvider = "cuda";
+                Debug.Log("[OnnxRuntime] CUDA execution provider registered (device 0)");
+            }
+            catch (Exception e)
+            {
+                // 常见原因：Plugins/Win 下缺 onnxruntime_providers_cuda.dll、
+                // CUDA Toolkit / cuDNN 版本不匹配、或 PATH 里找不到 cudnn64_*.dll。
+                ActiveExecutionProvider = "cpu";
+                Debug.LogWarning($"[OnnxRuntime] CUDA provider unavailable, falling back to CPU: {e.Message}");
+            }
+
+            return options;
         }
 
         private InferenceSession LoadSession(SessionOptions options, string dir, string fileName)

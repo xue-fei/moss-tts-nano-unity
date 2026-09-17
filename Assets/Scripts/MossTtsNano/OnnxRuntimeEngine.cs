@@ -196,7 +196,10 @@ namespace MossTtsNano
                     _streamingInputs[spec.offset_input_name] = NamedOnnxValue.CreateFromTensor(spec.offset_input_name, CreateZeroTensor<int>(spec.offset_shape));
                     _streamingInputs[spec.cached_keys_input_name] = NamedOnnxValue.CreateFromTensor(spec.cached_keys_input_name, CreateZeroTensor<float>(spec.cache_shape));
                     _streamingInputs[spec.cached_values_input_name] = NamedOnnxValue.CreateFromTensor(spec.cached_values_input_name, CreateZeroTensor<float>(spec.cache_shape));
-                    _streamingInputs[spec.cached_positions_input_name] = NamedOnnxValue.CreateFromTensor(spec.cached_positions_input_name, CreateZeroTensor<int>(spec.positions_shape));
+                    // Python: positions = np.full(tuple(spec["positions_shape"]), -1, dtype=np.int32)
+                    // 必须用 -1 初始化，不能用 0！0 是有效的 position 索引，
+                    // -1 让 attention 在首次 decode 时知道哪些位置是无效的。
+                    _streamingInputs[spec.cached_positions_input_name] = NamedOnnxValue.CreateFromTensor(spec.cached_positions_input_name, CreateFilledTensor<int>(spec.positions_shape, -1));
                 }
             }
         }
@@ -206,6 +209,15 @@ namespace MossTtsNano
             int totalLength = 1;
             foreach (int dim in shape) totalLength *= dim;
             T[] data = new T[totalLength];
+            return new DenseTensor<T>(data, shape);
+        }
+
+        private DenseTensor<T> CreateFilledTensor<T>(int[] shape, T fill) where T : struct
+        {
+            int totalLength = 1;
+            foreach (int dim in shape) totalLength *= dim;
+            T[] data = new T[totalLength];
+            for (int i = 0; i < data.Length; i++) data[i] = fill;
             return new DenseTensor<T>(data, shape);
         }
 
@@ -423,7 +435,9 @@ namespace MossTtsNano
             // 随机数消耗顺序必须与 Python 参考实现一致：先 assistant，再 audio。
             // 每帧 frame_s 先从 rng 取 1 个 [1] 给 assistant_random_u，再取 N_VQ 个 [1,N_VQ]
             // 给 audio_random_u。顺序反了会让模型收到完全错的随机值，should_continue 决策都不同。
-            float assistantRandom = (float)rng.NextDouble();
+            // Python: min(0.99999994, max(0.0, float(self.rng.random())))
+            // NextDouble() ∈ [0, 1)，但 Python random() ∈ [0, 1]，需要钳位到 0.99999994
+            float assistantRandom = ClampedRandom(rng);
 
             // 随机数缓冲同样复用，避免每帧的 LINQ 分配。
             if (_audioRandomBuffer == null || _audioRandomBuffer.Length != _nVq)
@@ -432,7 +446,7 @@ namespace MossTtsNano
                 _audioRandomTensor = new DenseTensor<float>(_audioRandomBuffer, new[] { 1, _nVq });
             }
             for (int i = 0; i < _nVq; i++)
-                _audioRandomBuffer[i] = (float)rng.NextDouble();
+                _audioRandomBuffer[i] = ClampedRandom(rng);
 
             var globalHiddenTensor = new DenseTensor<float>(globalHidden, new[] { 1, globalHidden.Length });
             var assistantRandomTensor = new DenseTensor<float>(new[] { assistantRandom }, new[] { 1 });
@@ -511,7 +525,58 @@ namespace MossTtsNano
 
         public List<int[]> CodecEncode(float[] waveform, int sampleRate)
         {
-            return new List<int[]>();
+            if (_codecEncodeSession == null)
+                throw new InvalidOperationException("Codec encode session not loaded");
+
+            // 波形是通道交错的 [ch0_s0, ch1_s0, ch0_s1, ch1_s1, ...]（LoadAudio 的输出格式）
+            // codec encoder 要求 [batch, channels, samples] 的非交错布局。
+            int channels = _codecMeta.codec_config.channels;
+            int samplesPerChannel = waveform.Length / channels;
+
+            if (samplesPerChannel <= 0)
+                return new List<int[]>();
+
+            // 将交错数据重排为 [channels, samples]，然后转 [1, channels, samples]
+            var nonInterleaved = new float[channels * samplesPerChannel];
+            for (int s = 0; s < samplesPerChannel; s++)
+            {
+                for (int ch = 0; ch < channels; ch++)
+                {
+                    nonInterleaved[ch * samplesPerChannel + s] = waveform[s * channels + ch];
+                }
+            }
+
+            var waveformTensor = new DenseTensor<float>(nonInterleaved, new[] { 1, channels, samplesPerChannel });
+            var inputLengthsTensor = new DenseTensor<int>(new[] { samplesPerChannel }, new[] { 1 });
+
+            var inputs = new NamedOnnxValue[]
+            {
+                NamedOnnxValue.CreateFromTensor("waveform", waveformTensor),
+                NamedOnnxValue.CreateFromTensor("input_lengths", inputLengthsTensor)
+            };
+
+            using var results = _codecEncodeSession.Run(inputs);
+
+            var audioCodesTensor = results.First(r => r.Name == "audio_codes").AsTensor<int>();
+            var lengthsTensor = results.First(r => r.Name == "audio_code_lengths").AsTensor<int>();
+            int codeLength = TensorToArray(lengthsTensor)[0];
+
+            var audioCodesData = TensorToArray(audioCodesTensor);
+            var dims = audioCodesTensor.Dimensions;
+            int numQuantizers = dims.Length >= 3 ? dims[2] : _codecMeta.codec_config.num_quantizers;
+
+            var promptAudioCodes = new List<int[]>();
+            for (int frameIndex = 0; frameIndex < codeLength; frameIndex++)
+            {
+                var frame = new int[numQuantizers];
+                for (int q = 0; q < numQuantizers; q++)
+                {
+                    frame[q] = audioCodesData[frameIndex * numQuantizers + q];
+                }
+                promptAudioCodes.Add(frame);
+            }
+
+            return promptAudioCodes;
         }
 
         public (float[][] channelArrays, int audioLength) CodecDecode(List<int[]> generatedFrames)
@@ -741,6 +806,17 @@ namespace MossTtsNano
             for (int i = 0; i < actual; i++)
                 result[i] = tensor.GetValue(offset + i);
             return result;
+        }
+
+        /// <summary>
+        /// Python: min(0.99999994, max(0.0, float(self.rng.random())))
+        /// NextDouble() ∈ [0, 1)，但 Python random() ∈ [0, 1]，需要钳位到 0.99999994。
+        /// </summary>
+        private static float ClampedRandom(System.Random rng)
+        {
+            double v = rng.NextDouble();
+            if (v >= 1.0) v = 0.99999994;
+            return (float)v;
         }
 
         #endregion

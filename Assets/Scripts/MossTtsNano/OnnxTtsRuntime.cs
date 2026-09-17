@@ -59,12 +59,25 @@ namespace MossTtsNano
 
         private void InitializeTokenizer(string modelDir)
         {
-            // tokenizer_sp.json + tokenizer_charsmap.bytes 与模型同目录，
-            // 由 MOSS-TTS-Nano/export_tokenizer_assets.py 从 tokenizer.model 导出。
-            // 旧的 tokenizer_vocab_parallel.json 只有 pieces/scores，缺 types 与
-            // nmt_nfkc 归一化规则表，无法复现官方切分，已不再使用。
-            string spJsonPath = Path.GetFullPath(Path.Combine(_modelDir, "tokenizer_sp.json"));
+            // 优先尝试直接从 tokenizer.model 二进制 protobuf 加载，无需 Python 预导出。
+            string modelPath = Path.GetFullPath(Path.Combine(_modelDir, "tokenizer.model"));
+            if (File.Exists(modelPath))
+            {
+                try
+                {
+                    byte[] modelBytes = File.ReadAllBytes(modelPath);
+                    _tokenizer = new SentencePieceTokenizer(modelBytes);
+                    Debug.Log($"[OnnxTtsRuntime] Tokenizer loaded directly from {modelPath}");
+                    return;
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"[OnnxTtsRuntime] Failed to load tokenizer from {modelPath}: {e}");
+                }
+            }
 
+            // 回退：从 export_tokenizer_assets.py 导出的 tokenizer_sp.json 加载。
+            string spJsonPath = Path.GetFullPath(Path.Combine(_modelDir, "tokenizer_sp.json"));
             if (File.Exists(spJsonPath))
             {
                 try
@@ -78,19 +91,12 @@ namespace MossTtsNano
                     Debug.LogError($"[OnnxTtsRuntime] Failed to load tokenizer from {spJsonPath}: {e}");
                 }
             }
-            else
-            {
-                Debug.LogError(
-                    $"[OnnxTtsRuntime] {spJsonPath} not found. Generate it with:\n" +
-                    "  python MOSS-TTS-Nano/export_tokenizer_assets.py " +
-                    "<model_dir>/tokenizer.model <model_dir>");
-            }
 
             // 回退分词器的 id 与模型词表毫无关系，合成结果必然是噪声，
             // 这里明确告知而不是让它静默产出坏音频。
             Debug.LogError(
                 "[OnnxTtsRuntime] Falling back to SimpleUnicodeTokenizer — " +
-                "synthesized audio WILL be wrong until the SentencePiece assets are present.");
+                "synthesized audio WILL be wrong until the SentencePiece model is present.");
             _tokenizer = new SimpleUnicodeTokenizer();
         }
 
@@ -146,26 +152,12 @@ namespace MossTtsNano
         }
 
         /// <summary>
-        /// 简单 TTS 文本归一化
+        /// TTS 文本鲁棒性归一化，对齐 Python tts_robust_normalizer_single_script.py。
+        /// 修复原实现只做 Trim + 去除控制字符，导致汉字间空格被 SentencePiece
+        /// 编成 ▁ token 产生词间不合理空白的问题。
         /// </summary>
-        private string NormalizeTtsText(string text)
-        {
-            if (string.IsNullOrEmpty(text)) return text;
-
-            // 基础清理
-            text = text.Trim();
-            text = System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ");
-
-            // 移除控制字符
-            var sb = new StringBuilder();
-            foreach (char c in text)
-            {
-                if (!char.IsControl(c) || c == '\n' || c == '\t')
-                    sb.Append(c);
-            }
-
-            return sb.ToString();
-        }
+        private static string NormalizeTtsText(string text) =>
+            TtsRobustNormalizer.Normalize(text);
 
         /// <summary>
         /// 按 token 预算切分文本
@@ -340,6 +332,10 @@ namespace MossTtsNano
             bool streaming = false,
             int? maxNewFrames = null,
             int voiceCloneMaxTextTokens = 75,
+            float textTopP = 1.0f,
+            int textTopK = 50,
+            float audioTopP = 0.95f,
+            int audioTopK = 25,
             bool enableWeText = true,
             bool enableNormalize = true,
             int? seed = null)
@@ -350,6 +346,13 @@ namespace MossTtsNano
             string normalizedSampleMode = NormalizeSampleMode(sampleMode ?? _manifest.generation_defaults.sample_mode, doSample);
             _manifest.generation_defaults.sample_mode = normalizedSampleMode;
             _manifest.generation_defaults.do_sample = normalizedSampleMode != SampleModeGreedy;
+
+            // 应用采样参数。这些值由用户通过 Inspector 或 API 控制，
+            // 仅在 "full" 采样模式下生效（fixed 模式用 ONNX 内置常数）。
+            _manifest.generation_defaults.text_top_p = textTopP;
+            _manifest.generation_defaults.text_top_k = textTopK;
+            _manifest.generation_defaults.audio_top_p = audioTopP;
+            _manifest.generation_defaults.audio_top_k = audioTopK;
 
             if (seed.HasValue)
                 _rng = new System.Random(seed.Value);
@@ -397,6 +400,14 @@ namespace MossTtsNano
                 }
             }
 
+            // 开头添加短暂静音前缀，让音频起始有自然停顿感。
+            // Python 端模型自发生成少量前置静音，C# 端目前没有，需手动补上。
+            int leadingSilenceSamples = Mathf.RoundToInt(sampleRate * 0.15f);
+            if (leadingSilenceSamples > 0)
+            {
+                allWaveforms.Insert(0, new float[leadingSilenceSamples * channels]);
+            }
+
             // 合并波形
             float[] finalWaveform = ConcatWaveforms(allWaveforms);
 
@@ -425,12 +436,22 @@ namespace MossTtsNano
             string promptAudioPath = null,
             int? maxNewFrames = null,
             int voiceCloneMaxTextTokens = 75,
+            float textTopP = 1.0f,
+            int textTopK = 50,
+            float audioTopP = 0.95f,
+            int audioTopK = 25,
             bool enableWeText = true,
             bool enableNormalize = true,
             int? seed = null)
         {
             if (maxNewFrames.HasValue)
                 _manifest.generation_defaults.max_new_frames = maxNewFrames.Value;
+
+            // 应用采样参数（与 Synthesize 一致）
+            _manifest.generation_defaults.text_top_p = textTopP;
+            _manifest.generation_defaults.text_top_k = textTopK;
+            _manifest.generation_defaults.audio_top_p = audioTopP;
+            _manifest.generation_defaults.audio_top_k = audioTopK;
 
             if (seed.HasValue)
                 _rng = new System.Random(seed.Value);
@@ -454,6 +475,24 @@ namespace MossTtsNano
                 int emittedSamplesTotal = 0;
                 float? firstAudioEmittedAt = null;
 
+                // 第一个 chunk 前插入短暂静音，与 Synthesize 的 leading 前缀一致
+                if (chunkIndex == 0)
+                {
+                    int leadingSilenceSamples = Mathf.RoundToInt(sampleRate * 0.15f);
+                    if (leadingSilenceSamples > 0)
+                    {
+                        events.Add(new AudioChunkEvent
+                        {
+                            Waveform = new float[leadingSilenceSamples * channels],
+                            SampleRate = sampleRate,
+                            ChunkIndex = chunkIndex,
+                            IsPause = true,
+                            EmittedAudioSeconds = 0f,
+                            LeadSeconds = 0f
+                        });
+                    }
+                }
+
                 List<int> textTokenIds = EncodeText(chunkText);
                 var (inputIds, attentionMask) = BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIds);
 
@@ -462,7 +501,7 @@ namespace MossTtsNano
 
                 // 与 SynthesizeSingleChunk 一致的 pending 队列语义：
                 // decode_step 是有状态会话，必须按 budget 分批消费、消费后移除。
-                void DecodePendingFrames(bool force)
+                void DecodePendingFrames(bool force, bool isPause = false)
                 {
                     int pendingCount = pendingDecodeFrames.Count;
                     if (pendingCount <= 0) return;
@@ -492,7 +531,7 @@ namespace MossTtsNano
                         Waveform = audio,
                         SampleRate = sampleRate,
                         ChunkIndex = chunkIndex,
-                        IsPause = false,
+                        IsPause = isPause,
                         EmittedAudioSeconds = emittedSeconds,
                         LeadSeconds = leadSeconds
                     });

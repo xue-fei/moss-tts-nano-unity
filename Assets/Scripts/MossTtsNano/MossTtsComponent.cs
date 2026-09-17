@@ -1,5 +1,4 @@
 using System;
-using System.Collections;
 using System.Collections.Concurrent;
 using System.IO;
 using System.Threading;
@@ -87,8 +86,20 @@ namespace MossTtsNano
         [Tooltip("文本温度")]
         public float TextTemperature = 1.0f;
 
+        [Tooltip("文本 Top-P (nucleus sampling)。1.0 = 不裁剪")]
+        public float TextTopP = 1.0f;
+
+        [Tooltip("文本 Top-K。50 = 保留前 50 个候选")]
+        public int TextTopK = 50;
+
         [Tooltip("音频温度")]
         public float AudioTemperature = 0.8f;
+
+        [Tooltip("音频 Top-P (nucleus sampling)。0.95 = 保留累积概率前 95% 的候选")]
+        public float AudioTopP = 0.95f;
+
+        [Tooltip("音频 Top-K。25 = 保留前 25 个候选")]
+        public int AudioTopK = 25;
 
         [Tooltip("音频重复惩罚")]
         public float AudioRepetitionPenalty = 1.2f;
@@ -131,7 +142,7 @@ namespace MossTtsNano
 
         private void Start()
         {
-            LoadModel();
+            LoadModelAsync();
         }
 
         private void Update()
@@ -157,51 +168,59 @@ namespace MossTtsNano
         }
 
         /// <summary>
-        /// 加载模型
+        /// 异步加载模型（使用 Loom 在后台线程执行，避免主线程卡顿）
         /// </summary>
-        public void LoadModel()
+        private void LoadModelAsync()
         {
-            try
+            // Application.dataPath / streamingAssetsPath 只能在主线程调用，提前捕获
+            string streamingAssetsPath = Application.streamingAssetsPath;
+            string dataPath = Application.dataPath;
+
+            Loom.RunAsync(() =>
             {
-                string relativeDir = NormalizeModelDir(ModelDir);
-                string modelDir = Path.GetFullPath(
-                    Path.Combine(Application.streamingAssetsPath, relativeDir));
-
-                if (!Directory.Exists(modelDir) ||
-                    !File.Exists(Path.Combine(modelDir, "browser_poc_manifest.json")))
+                try
                 {
-                    Debug.LogError(
-                        $"[MossTts] Model directory not found or missing browser_poc_manifest.json: {modelDir}\n" +
-                        $"(ModelDir='{ModelDir}' → '{relativeDir}', " +
-                        $"streamingAssetsPath='{Application.streamingAssetsPath}')");
-                    OnError?.Invoke("Model directory not found");
-                    return;
+                    string relativeDir = NormalizeModelDir(ModelDir);
+                    string modelDir = Path.GetFullPath(
+                        Path.Combine(streamingAssetsPath, relativeDir));
+
+                    if (!Directory.Exists(modelDir) ||
+                        !File.Exists(Path.Combine(modelDir, "browser_poc_manifest.json")))
+                    {
+                        string errorMsg = $"[MossTts] Model directory not found: {modelDir}";
+                        Debug.LogError(errorMsg);
+                        Loom.QueueOnMainThread(() => OnError?.Invoke(errorMsg));
+                        return;
+                    }
+
+                    string outputDir = string.IsNullOrEmpty(OutputDir)
+                        ? Path.Combine(dataPath, "MossTtsOutput")
+                        : OutputDir;
+
+                    var service = new MossTtsService(modelDir, outputDir, ThreadCount, ExecutionProvider);
+                    service.LoadModel();
+
+                    Loom.QueueOnMainThread(() =>
+                    {
+                        _service = service;
+                        OnModelLoaded?.Invoke();
+
+                        string activeEp = _service.ActiveExecutionProvider;
+                        if (!string.Equals(activeEp, ExecutionProvider, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Debug.LogWarning(
+                                $"[MossTts] Requested EP '{ExecutionProvider}' but running on '{activeEp}'.");
+                        }
+                        Debug.Log($"[MossTts] Model loaded from {modelDir} (EP={activeEp})");
+                    });
                 }
-
-                string outputDir = string.IsNullOrEmpty(OutputDir)
-                    ? Path.Combine(Application.dataPath, "MossTtsOutput")
-                    : OutputDir;
-
-                _service = new MossTtsService(modelDir, outputDir, ThreadCount, ExecutionProvider);
-                _service.LoadModel();
-                OnModelLoaded?.Invoke();
-
-                // 明确区分"请求的 EP"和"实际生效的 EP"。CUDA 注册失败会静默回退到 CPU，
-                // 只看 Inspector 上的 ExecutionProvider 字段会误以为在用 GPU。
-                string activeEp = _service.ActiveExecutionProvider;
-                if (!string.Equals(activeEp, ExecutionProvider, StringComparison.OrdinalIgnoreCase))
+                catch (Exception e)
                 {
-                    Debug.LogWarning(
-                        $"[MossTts] Requested EP '{ExecutionProvider}' but running on '{activeEp}'. " +
-                        "CUDA 需要 onnxruntime-cuda 包的原生库 + 匹配的 CUDA Toolkit/cuDNN 在 PATH 里。");
+                    string errorMsg = $"[MossTts] Failed to load model: {e.Message}";
+                    Debug.LogError($"{errorMsg}\n{e.StackTrace}");
+                    Loom.QueueOnMainThread(() => OnError?.Invoke(errorMsg));
                 }
-                Debug.Log($"[MossTts] Model loaded from {modelDir} (EP={activeEp})");
-            }
-            catch (Exception e)
-            {
-                Debug.LogError($"[MossTts] Failed to load model: {e.Message}\n{e.StackTrace}");
-                OnError?.Invoke($"Failed to load model: {e.Message}");
-            }
+            });
         }
 
         /// <summary>
@@ -245,6 +264,10 @@ namespace MossTtsNano
                     voiceCloneMaxTextTokens: VoiceCloneMaxTextTokens,
                     doSample: DoSample,
                     sampleMode: SampleMode,
+                    textTopP: TextTopP,
+                    textTopK: TextTopK,
+                    audioTopP: AudioTopP,
+                    audioTopK: AudioTopK,
                     seed: ResolveSeed());
 
                 _mainThreadQueue.Enqueue(() =>
@@ -288,6 +311,10 @@ namespace MossTtsNano
                     voiceCloneMaxTextTokens: VoiceCloneMaxTextTokens,
                     doSample: DoSample,
                     sampleMode: SampleMode,
+                    textTopP: TextTopP,
+                    textTopK: TextTopK,
+                    audioTopP: AudioTopP,
+                    audioTopK: AudioTopK,
                     seed: ResolveSeed());
 
                 _mainThreadQueue.Enqueue(() =>
@@ -335,13 +362,17 @@ namespace MossTtsNano
             {
                 var chunks = await Task.Run(() =>
                 {
-                    return _service.SynthesizeStream(
-                        text,
-                        voice: voice ?? DefaultVoice,
-                        promptAudioPath: promptAudioPath,
-                        maxNewFrames: MaxNewFrames,
-                        voiceCloneMaxTextTokens: VoiceCloneMaxTextTokens,
-                        seed: ResolveSeed());
+                return _service.SynthesizeStream(
+                    text,
+                    voice: voice ?? DefaultVoice,
+                    promptAudioPath: promptAudioPath,
+                    maxNewFrames: MaxNewFrames,
+                    voiceCloneMaxTextTokens: VoiceCloneMaxTextTokens,
+                    textTopP: TextTopP,
+                    textTopK: TextTopK,
+                    audioTopP: AudioTopP,
+                    audioTopK: AudioTopK,
+                    seed: ResolveSeed());
                 }, ct);
 
                 _mainThreadQueue.Enqueue(() =>

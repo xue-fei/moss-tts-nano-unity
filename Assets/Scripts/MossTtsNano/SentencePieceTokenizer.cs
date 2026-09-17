@@ -142,6 +142,74 @@ namespace MossTtsNano
         }
 
         /// <summary>
+        /// 直接从 tokenizer.model 二进制 protobuf 加载，无需 Python 预导出步骤。
+        /// </summary>
+        public SentencePieceTokenizer(byte[] modelBytes)
+        {
+            var model = SentencePieceModel.Parse(modelBytes);
+
+            if (model.Pieces == null || model.Pieces.Length == 0)
+                throw new InvalidDataException("tokenizer model has no pieces");
+            if (model.Scores == null || model.Scores.Length != model.Pieces.Length)
+                throw new InvalidDataException("tokenizer model: scores length mismatch");
+            if (model.Types == null || model.Types.Length != model.Pieces.Length)
+                throw new InvalidDataException("tokenizer model: types length mismatch");
+            if (model.PrecompiledCharsMap == null || model.PrecompiledCharsMap.Length == 0)
+                throw new InvalidDataException("tokenizer model: precompiled_charsmap is missing");
+
+            _pieces = model.Pieces;
+            _scores = model.Scores;
+            _types = model.Types;
+            _byteFallback = model.ByteFallback;
+            _unkId = model.UnkId;
+            _bosId = model.BosId;
+            _eosId = model.EosId;
+            _padId = model.PadId;
+
+            _pieceToId = new Dictionary<string, int>(_pieces.Length);
+            _mergeIds = new SpByteMap(_pieces.Length);
+            var userDefined = new List<string>();
+            _maxPieceBytes = 0;
+
+            for (int i = 0; i < _pieces.Length; i++)
+            {
+                string piece = _pieces[i];
+                _pieceToId[piece] = i;
+
+                if (_types[i] == TypeUserDefined) userDefined.Add(piece);
+
+                // reserved_id_map_ 里的 CONTROL / UNKNOWN 不参与 BPE 合并，
+                // 对应原实现的 PieceToIdNoReserved + IsReservedId 双重排除。
+                if (_types[i] == TypeControl || _types[i] == TypeUnknown) continue;
+
+                byte[] bytes = PieceToBytes(piece, _types[i]);
+                if (bytes.Length == 0) continue;
+                _mergeIds.Add(bytes, i);
+                if (bytes.Length > _maxPieceBytes) _maxPieceBytes = bytes.Length;
+            }
+
+            _byteFallbackIds = new int[256];
+            for (int b = 0; b < 256; b++)
+            {
+                _byteFallbackIds[b] = _pieceToId.TryGetValue($"<0x{b:X2}>", out int id) ? id : _unkId;
+            }
+
+            _matcher = new SpPrefixMatcher(userDefined);
+
+            _normalizer = new SpNormalizer(
+                model.PrecompiledCharsMap,
+                model.AddDummyPrefix,
+                model.RemoveExtraWhitespaces,
+                model.EscapeWhitespaces,
+                _matcher);
+
+            Debug.Log(
+                $"[SentencePiece] {_pieces.Length} pieces (from .model), " +
+                $"byteFallback={_byteFallback}, maxPieceBytes={_maxPieceBytes}, " +
+                $"userDefined={userDefined.Count}");
+        }
+
+        /// <summary>
         /// BYTE 类型的 piece 字面量是 "&lt;0x8C&gt;"，但它在 BPE 合并里代表的是
         /// **那一个原始字节**。词表里的字面量拿去做字节匹配会匹配不到任何输入，
         /// 因此这里按类型还原成真实字节。

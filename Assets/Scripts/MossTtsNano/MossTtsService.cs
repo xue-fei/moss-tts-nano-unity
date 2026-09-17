@@ -92,6 +92,10 @@ namespace MossTtsNano
             int voiceCloneMaxTextTokens = 75,
             bool doSample = true,
             string sampleMode = "fixed",
+            float textTopP = 1.0f,
+            int textTopK = 50,
+            float audioTopP = 0.95f,
+            int audioTopK = 25,
             bool streaming = false,
             int? seed = null)
         {
@@ -108,6 +112,10 @@ namespace MossTtsNano
                     voiceCloneMaxTextTokens: voiceCloneMaxTextTokens,
                     doSample: doSample,
                     sampleMode: sampleMode,
+                    textTopP: textTopP,
+                    textTopK: textTopK,
+                    audioTopP: audioTopP,
+                    audioTopK: audioTopK,
                     streaming: streaming,
                     seed: seed);
             }
@@ -125,6 +133,10 @@ namespace MossTtsNano
             int voiceCloneMaxTextTokens = 75,
             bool doSample = true,
             string sampleMode = "fixed",
+            float textTopP = 1.0f,
+            int textTopK = 50,
+            float audioTopP = 0.95f,
+            int audioTopK = 25,
             bool streaming = false,
             int? seed = null,
             CancellationToken cancellationToken = default)
@@ -135,7 +147,9 @@ namespace MossTtsNano
                 return Synthesize(
                     text, voice, promptAudioPath, outputPath,
                     maxNewFrames, voiceCloneMaxTextTokens,
-                    doSample, sampleMode, streaming, seed);
+                    doSample, sampleMode,
+                    textTopP, textTopK, audioTopP, audioTopK,
+                    streaming, seed);
             }, cancellationToken);
         }
 
@@ -148,6 +162,10 @@ namespace MossTtsNano
             string promptAudioPath = null,
             int? maxNewFrames = null,
             int voiceCloneMaxTextTokens = 75,
+            float textTopP = 1.0f,
+            int textTopK = 50,
+            float audioTopP = 0.95f,
+            int audioTopK = 25,
             int? seed = null)
         {
             EnsureLoaded();
@@ -160,6 +178,10 @@ namespace MossTtsNano
                     promptAudioPath: promptAudioPath,
                     maxNewFrames: maxNewFrames,
                     voiceCloneMaxTextTokens: voiceCloneMaxTextTokens,
+                    textTopP: textTopP,
+                    textTopK: textTopK,
+                    audioTopP: audioTopP,
+                    audioTopK: audioTopK,
                     seed: seed);
             }
         }

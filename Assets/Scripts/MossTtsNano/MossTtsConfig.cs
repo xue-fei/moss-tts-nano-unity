@@ -64,6 +64,7 @@ namespace MossTtsNano
         public int SampleRate;
         public int Channels;
         public float ElapsedSeconds;
+        public float RTF;  // Real-Time Factor = ElapsedSeconds / AudioDurationSeconds，< 1.0 表示快于实时
         public string Voice;
         public string Mode;
         public string[] TextChunks;
@@ -81,6 +82,7 @@ namespace MossTtsNano
         public bool IsPause;
         public float EmittedAudioSeconds;
         public float LeadSeconds;
+        public float RTF;  // 到当前块为止的实时率
     }
 
     /// <summary>

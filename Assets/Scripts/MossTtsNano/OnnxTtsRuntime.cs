@@ -1,9 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
-using System.Linq;
-using System.Text;
+using System.Linq; 
 using UnityEngine;
+using Debug = UnityEngine.Debug;
 
 namespace MossTtsNano
 {
@@ -291,7 +292,7 @@ namespace MossTtsNano
                 if (audioLength <= 0) return;
 
                 if (!firstAudioEmittedAt.HasValue)
-                    firstAudioEmittedAt = Time.realtimeSinceStartup;
+                    firstAudioEmittedAt = (float)Stopwatch.GetTimestamp() / Stopwatch.Frequency;
 
                 emittedSamplesTotal += audioLength;
                 emittedChunks.Add(audio);
@@ -383,6 +384,8 @@ namespace MossTtsNano
             int sampleRate = _codecMeta.codec_config.sample_rate;
             int channels = _codecMeta.codec_config.channels;
 
+            float synthesisStart = (float)(Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency);
+
             for (int i = 0; i < textChunks.Count; i++)
             {
                 var (waveform, frames) = SynthesizeSingleChunk(textChunks[i], promptAudioCodes, streaming);
@@ -415,12 +418,19 @@ namespace MossTtsNano
             string audioPath = outputPath ?? Path.Combine(_outputDir, $"moss_tts_{DateTime.Now:yyyyMMdd_HHmmss}.wav");
             WriteWaveformToWav(audioPath, finalWaveform, sampleRate, channels);
 
+            float elapsedSeconds = (float)((double)Stopwatch.GetTimestamp() / Stopwatch.Frequency - synthesisStart);
+            float audioSamplesPerChannel = finalWaveform.Length / channels;
+            float audioDurationSeconds = audioSamplesPerChannel / sampleRate;
+            float rtf = audioDurationSeconds > 0.01f ? elapsedSeconds / audioDurationSeconds : 0f;
+
             return new SynthesisResult
             {
                 AudioPath = audioPath,
                 Waveform = finalWaveform,
                 SampleRate = sampleRate,
                 Channels = channels,
+                ElapsedSeconds = elapsedSeconds,
+                RTF = rtf,
                 Voice = voice ?? "Junhao",
                 Mode = "voice_clone",
                 TextChunks = textChunks.ToArray()
@@ -469,6 +479,7 @@ namespace MossTtsNano
             int channels = _codecMeta.codec_config.channels;
             int chunkIndex = 0;
             var events = new List<AudioChunkEvent>();
+            float streamStart = (float)Stopwatch.GetTimestamp() / Stopwatch.Frequency;
 
             foreach (string chunkText in textChunks)
             {
@@ -488,7 +499,8 @@ namespace MossTtsNano
                             ChunkIndex = chunkIndex,
                             IsPause = true,
                             EmittedAudioSeconds = 0f,
-                            LeadSeconds = 0f
+                            LeadSeconds = 0f,
+                            RTF = 0f
                         });
                     }
                 }
@@ -518,13 +530,15 @@ namespace MossTtsNano
                     var (audio, audioLength) = _engine.CodecDecodeStep(frameChunk);
                     if (audioLength <= 0) return;
 
-                    if (!firstAudioEmittedAt.HasValue)
-                        firstAudioEmittedAt = Time.realtimeSinceStartup;
+                if (!firstAudioEmittedAt.HasValue)
+                    firstAudioEmittedAt = (float)Stopwatch.GetTimestamp() / Stopwatch.Frequency;
 
-                    emittedSamplesTotal += audioLength;
+                emittedSamplesTotal += audioLength;
 
-                    float emittedSeconds = emittedSamplesTotal / (float)sampleRate;
-                    float leadSeconds = emittedSeconds - (Time.realtimeSinceStartup - firstAudioEmittedAt.Value);
+                float emittedSeconds = emittedSamplesTotal / (float)sampleRate;
+                float leadSeconds = emittedSeconds - (float)((double)Stopwatch.GetTimestamp() / Stopwatch.Frequency - firstAudioEmittedAt.Value);
+                float elapsedSoFar = (float)((double)Stopwatch.GetTimestamp() / Stopwatch.Frequency - streamStart);
+                float chunkRtf = emittedSeconds > 0.01f ? elapsedSoFar / emittedSeconds : 0f;
 
                     events.Add(new AudioChunkEvent
                     {
@@ -533,7 +547,8 @@ namespace MossTtsNano
                         ChunkIndex = chunkIndex,
                         IsPause = isPause,
                         EmittedAudioSeconds = emittedSeconds,
-                        LeadSeconds = leadSeconds
+                        LeadSeconds = leadSeconds,
+                        RTF = chunkRtf
                     });
                 }
 

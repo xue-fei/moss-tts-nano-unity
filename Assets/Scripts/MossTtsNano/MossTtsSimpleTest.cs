@@ -89,11 +89,14 @@ namespace MossTtsNano
 
         void OnSynthesisComplete(SynthesisResult result)
         {
+            float duration = result.Waveform.Length / (float)result.SampleRate;
             Debug.Log($"[MossTtsSimpleTest] Synthesis complete!");
             Debug.Log($"[MossTtsSimpleTest] Samples: {result.Waveform.Length}");
             Debug.Log($"[MossTtsSimpleTest] SampleRate: {result.SampleRate}");
             Debug.Log($"[MossTtsSimpleTest] Channels: {result.Channels}");
-            Debug.Log($"[MossTtsSimpleTest] Duration: {result.Waveform.Length / (float)result.SampleRate:F2}s");
+            Debug.Log($"[MossTtsSimpleTest] Duration: {duration:F2}s");
+            Debug.Log($"[MossTtsSimpleTest] Elapsed: {result.ElapsedSeconds:F2}s");
+            Debug.Log($"[MossTtsSimpleTest] RTF: {result.RTF:F3}");
             Debug.Log($"[MossTtsSimpleTest] File: {result.AudioPath}");
             Debug.Log($"[MossTtsSimpleTest] Chunks: {result.TextChunks?.Length ?? 0}");
 

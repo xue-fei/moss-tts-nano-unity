@@ -141,6 +141,8 @@ namespace MossTtsNano
                          $"SampleRate: {result.SampleRate}\n" +
                          $"Channels: {result.Channels}\n" +
                          $"Duration: {result.Waveform.Length / (float)result.SampleRate:F2}s\n" +
+                         $"Elapsed: {result.ElapsedSeconds:F2}s\n" +
+                         $"RTF: {result.RTF:F3}\n" +
                          $"File: {result.AudioPath}\n" +
                          $"Chunks: {result.TextChunks?.Length ?? 0}";
             UpdateStatus(info);
